@@ -10,6 +10,33 @@ function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>(
     shouldBypassAuth ? 'authenticated' : 'checking'
   )
+  const [showLogin, setShowLogin] = useState(false)
+
+  const updateAuthQuery = (shouldShowLogin: boolean) => {
+    if (typeof window === 'undefined') {
+      return
+    }
+
+    const params = new URLSearchParams(window.location.search)
+    if (shouldShowLogin) {
+      params.set('auth', 'login')
+    } else {
+      params.delete('auth')
+    }
+    const query = params.toString()
+    const nextUrl = query ? `${window.location.pathname}?${query}` : window.location.pathname
+    window.history.replaceState({}, document.title, nextUrl)
+  }
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('auth') === 'login') {
+      setShowLogin(true)
+    }
+  }, [])
 
   useEffect(() => {
     if (shouldBypassAuth) {
@@ -74,6 +101,13 @@ function App() {
     return cleanup
   }, [shouldBypassAuth])
 
+  useEffect(() => {
+    if (authStatus === 'authenticated') {
+      setShowLogin(false)
+      updateAuthQuery(false)
+    }
+  }, [authStatus])
+
   let content: ReactNode
 
   if (authStatus === 'checking') {
@@ -82,10 +116,24 @@ function App() {
         正在验证登录状态...
       </div>
     )
-  } else if (authStatus === 'authenticated') {
-    content = <ImageCombiner />
+  } else if (showLogin) {
+    content = (
+      <LoginPage
+        onBack={() => {
+          setShowLogin(false)
+          updateAuthQuery(false)
+        }}
+      />
+    )
   } else {
-    content = <LoginPage />
+    content = (
+      <ImageCombiner
+        onRequestAuth={() => {
+          setShowLogin(true)
+          updateAuthQuery(true)
+        }}
+      />
+    )
   }
 
   return (

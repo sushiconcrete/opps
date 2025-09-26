@@ -204,7 +204,11 @@ type Monitor = {
   createdAt: string
 }
 
-export function ImageCombiner() {
+type ImageCombinerProps = {
+  onRequestAuth: () => void
+}
+
+export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
   const [url, setUrl] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -371,7 +375,21 @@ export function ImageCombiner() {
           : "justify-start font-roboto"
       }`}
     >
-      {view === "form" && <AnimatedBackground />}
+      {view === "form" && (
+        <>
+          <AnimatedBackground />
+          <div className="absolute right-6 top-6 z-20 flex items-center gap-2 sm:gap-3">
+            <Button
+              type="button"
+              onClick={onRequestAuth}
+              className="h-9 rounded-full bg-gradient-to-br from-[#2563EB] via-[#2563EB] to-[#1D4ED8] px-4 text-sm font-semibold text-white shadow-lg transition hover:from-[#1D4ED8] hover:to-[#1E40AF]"
+            >
+              Sign up
+            </Button>
+            <ModeToggle />
+          </div>
+        </>
+      )}
 
       {view === "form" ? (
         <div className="relative z-10 flex w-full max-w-4xl flex-col items-center gap-6 text-center">
@@ -418,15 +436,15 @@ type RunFormProps = {
 function LandingForm({ url, onUrlChange, isSubmitting, onSubmit }: RunFormProps) {
   return (
     <form onSubmit={onSubmit} className="flex w-full flex-col items-center gap-4">
-      <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center">
-        <div className="flex w-full items-center gap-3 rounded-xl border border-input bg-card px-4 py-2 shadow-sm transition-colors dark:bg-card/60">
+      <div className="flex w-full max-w-2xl flex-col gap-3 sm:flex-row sm:items-center">
+        <div className="flex w-full items-center gap-2 rounded-lg border border-input bg-card px-3 py-1.5 shadow-sm transition-colors dark:bg-card/60">
           <span className="font-inter text-xs tracking-[0.35em] text-muted-foreground">https://</span>
           <Input
             value={url}
             onChange={(event) => onUrlChange(event.target.value)}
             variant="ghost"
             placeholder="your homepage here"
-            className="font-mono text-sm text-foreground focus-visible:ring-0 placeholder:text-muted-foreground"
+            className="font-mono text-sm text-foreground focus-visible:ring-0 placeholder:text-muted-foreground h-8 w-full"
             autoComplete="off"
             aria-label="Company URL"
           />
@@ -435,7 +453,7 @@ function LandingForm({ url, onUrlChange, isSubmitting, onSubmit }: RunFormProps)
           type="submit"
           isLoading={isSubmitting}
           loadingText="Scanning..."
-          className="h-12 min-w-[12rem] rounded-xl bg-primary text-sm font-semibold text-primary-foreground shadow-sm transition hover:bg-primary/90"
+          className="h-10 min-w-[5rem] rounded-lg bg-black text-white shadow-sm transition hover:bg-black/90 dark:bg-white dark:text-black dark:hover:bg-white/90"
           disabled={isSubmitting}
         >
           Find
@@ -458,7 +476,7 @@ function LandingContent({
 }: LandingContentProps) {
   return (
     <>
-      <span className="text-5xl font-mono tracking-[0.35em] text-foreground">opp</span>
+      <span className="text-5xl font-mono tracking-[0.35em] text-foreground pl-2">opp_</span>
       <h1 className="flex flex-col text-3xl font-mono text-foreground sm:text-4xl">
         <span>Competitive Intelligence agent for</span>
         <span className="block min-h-[1.5em] text-green-500">

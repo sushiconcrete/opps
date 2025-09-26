@@ -11,7 +11,7 @@ export function AnimatedBackground() {
         speed={0.5}
         shape="wave"
         type="4x4"
-        pxSize={5}
+        pxSize={1.9}
         scale={-3}
         style={{ width: "100vw", height: "100vh", opacity: 0.3}}
       />

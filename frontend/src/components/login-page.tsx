@@ -4,7 +4,11 @@ import { AnimatedBackground } from "@/components/animated-background"
 import { Button } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
 
-export function LoginPage() {
+type LoginPageProps = {
+  onBack?: () => void
+}
+
+export function LoginPage({ onBack }: LoginPageProps = {}) {
   const [loadingState, setLoadingState] = useState({ google: false, github: false })
   const [error, setError] = useState<string>("")
   const [successMessage, setSuccessMessage] = useState<string>("")
@@ -51,7 +55,18 @@ export function LoginPage() {
   return (
     <div className="relative flex min-h-screen flex-col items-center justify-center overflow-hidden bg-background px-6 text-foreground">
       <AnimatedBackground />
-      <div className="absolute right-6 top-6 z-20">
+      <div className="absolute right-6 top-6 z-20 flex items-center gap-2">
+        {onBack && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onBack}
+            className="rounded-full px-3"
+          >
+            Back
+          </Button>
+        )}
         <ModeToggle />
       </div>
 
