@@ -203,13 +203,14 @@ type Monitor = MonitorSummary
 type ArchiveItem = ArchiveEntry
 type ImageCombinerProps = {
   onRequestAuth: () => void
+  isAuthenticated?: boolean
 }
 
-export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
+export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageCombinerProps) {
   const [url, setUrl] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [view, setView] = useState<"form" | "results">("form")
+  const [view, setView] = useState<"form" | "results">(() => (isAuthenticated ? "results" : "form"))
   const [activeCompany, setActiveCompany] = useState<string | null>(null)
   const [tenant, setTenant] = useState<TenantSnapshot | null>(null)
   const [competitorCards, setCompetitorCards] = useState<CardItem[]>([])
@@ -349,6 +350,14 @@ export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
     loadArchives()
   }, [loadMonitors, loadArchives])
 
+  useEffect(() => {
+    if (isAuthenticated) {
+      setView((current) => (current === "form" ? "results" : current))
+    } else {
+      setView("form")
+    }
+  }, [isAuthenticated])
+
   const handleUrlChange = (value: string) => {
     setUrl(value.replace(/^https?:\/\//i, ""))
   }
@@ -468,6 +477,13 @@ export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
     event.preventDefault()
     const trimmedUrl = url.trim()
     if (!trimmedUrl) return
+
+    // If not authenticated, redirect to login page instead of starting analysis
+    if (!isAuthenticated) {
+      onRequestAuth()
+      setView("form")
+      return
+    }
 
     streamRef.current?.cancel()
     setError(null)
@@ -989,6 +1005,16 @@ function ResultsView({
           <button 
             type="button"
             className="text-sm text-muted-foreground transition-colors duration-200 hover:text-foreground"
+            onClick={() => {
+              try {
+                if (typeof window !== 'undefined') {
+                  window.localStorage.removeItem('auth_token')
+                  window.location.replace(window.location.pathname)
+                }
+              } catch {
+                // noop
+              }
+            }}
           >
             Log out
           </button>

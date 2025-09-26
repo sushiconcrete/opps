@@ -132,6 +132,7 @@ function App() {
           setShowLogin(true)
           updateAuthQuery(true)
         }}
+        isAuthenticated={authStatus === 'authenticated'}
       />
     )
   }
