@@ -1942,6 +1942,137 @@ async def get_results(task_id: str, db: Session = Depends(get_db)):
         "completed_at": task.completed_at
     }
 
+@app.get("/api/analyze/{task_id}/progress")
+async def get_analysis_progress(task_id: str, current_user = Depends(require_auth), db: Session = Depends(get_db)):
+    """Return staged progress events for a given task.
+
+    If in-memory history exists, return it. Otherwise, reconstruct stages from
+    persisted task results and recent change detections so dashboards for existing
+    users render tenant, competitors, and change radar.
+    """
+    try:
+        user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        task = task_crud.get_task(db, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Ensure user owns the task if ownership is tracked
+        if hasattr(task, 'user_id') and task.user_id and str(task.user_id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        # Prefer in-memory event history when available
+        history = event_broker.get_history(task_id)
+        if history:
+            return { 'events': history }
+
+        # Fallback: reconstruct from persisted results and DB
+        events: List[Dict[str, Any]] = []
+        results: Dict[str, Any] = task.results or {}
+
+        tenant_snapshot = results.get('tenant')
+        if tenant_snapshot:
+            events.append({
+                'type': 'stage',
+                'stage': 'tenant',
+                'data': tenant_snapshot,
+                'progress': 40
+            })
+
+        # Competitors
+        competitors_list = results.get('competitors') or []
+        tracked_ids: List[str] = []
+        try:
+            # If the task is tied to a monitor, include tracked competitor ids
+            monitor_id = getattr(task, 'monitor_id', None)
+            if monitor_id:
+                tracked_ids = monitor_competitor_crud.get_tracked_competitor_ids(db, monitor_id)
+        except Exception:
+            tracked_ids = []
+
+        if isinstance(competitors_list, list) and competitors_list:
+            events.append({
+                'type': 'stage',
+                'stage': 'competitors',
+                'data': {
+                    'competitors': competitors_list,
+                    'tracked_competitor_ids': tracked_ids,
+                },
+                'progress': 70
+            })
+
+        # Changes: pull recent detections for the competitor ids involved in this task
+        change_stage_payload: Dict[str, Any] = { 'changes': [] }
+        try:
+            from database.models import ChangeDetection
+
+            # Collect candidate competitor ids from results
+            candidate_ids: List[str] = []
+            for item in competitors_list:
+                if not isinstance(item, dict):
+                    continue
+                cid = None
+                if isinstance(item.get('competitor_id'), str):
+                    cid = item.get('competitor_id')
+                elif isinstance(item.get('id'), str):
+                    cid = item.get('id')
+                if cid and cid not in candidate_ids:
+                    candidate_ids.append(cid)
+
+            if candidate_ids:
+                records = (
+                    db.query(ChangeDetection)
+                    .filter(ChangeDetection.competitor_id.in_(candidate_ids))
+                    .order_by(ChangeDetection.detected_at.desc())
+                    .limit(120)
+                    .all()
+                )
+
+                read_map: Dict[str, Any] = {}
+                try:
+                    read_map = change_read_crud.fetch_read_ids(db, user_id, [r.id for r in records])
+                except Exception:
+                    read_map = {}
+
+                for record in records:
+                    read_at_value = None
+                    if record.id in read_map and read_map[record.id]:
+                        try:
+                            read_at_value = read_map[record.id].isoformat()
+                        except Exception:
+                            read_at_value = None
+                    change_stage_payload['changes'].append({
+                        'id': record.id,
+                        'url': record.url,
+                        'change_type': record.change_type,
+                        'content': record.content,
+                        'timestamp': record.detected_at.isoformat() if getattr(record, 'detected_at', None) else None,
+                        'threat_level': getattr(record, 'threat_level', None),
+                        'why_matter': getattr(record, 'why_matter', None),
+                        'suggestions': getattr(record, 'suggestions', None),
+                        'read_at': read_at_value
+                    })
+
+        except Exception as changes_error:
+            logger.warning(f"Failed to reconstruct changes for task {task_id}: {changes_error}")
+
+        if change_stage_payload['changes']:
+            events.append({
+                'type': 'stage',
+                'stage': 'changes',
+                'data': change_stage_payload,
+                'progress': 90
+            })
+
+        return { 'events': events }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get analysis progress: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get analysis progress")
+
 @app.get("/api/tasks")
 async def get_recent_tasks(limit: int = 10, db: Session = Depends(get_db)):
     """获取最近的任务列表"""

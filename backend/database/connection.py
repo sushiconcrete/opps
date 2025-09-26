@@ -101,10 +101,52 @@ def init_db():
         
         # Drop and recreate all tables for clean start (be careful in production!)
         try:
-            Base.metadata.drop_all(bind=engine)
-            logger.info("已删除现有表结构")
+            # First, drop foreign key constraints to avoid circular dependencies
+            with engine.connect() as conn:
+                # Disable foreign key checks temporarily
+                conn.execute(text("SET session_replication_role = replica;"))
+                
+                # Drop all tables
+                Base.metadata.drop_all(bind=engine)
+                logger.info("已删除现有表结构")
+                
+                # Re-enable foreign key checks
+                conn.execute(text("SET session_replication_role = DEFAULT;"))
+                conn.commit()
+                
         except Exception as e:
             logger.warning(f"删除表时出现警告: {e}")
+            # Try alternative approach - drop tables individually
+            try:
+                with engine.connect() as conn:
+                    # Get all table names
+                    result = conn.execute(text("""
+                        SELECT tablename FROM pg_tables 
+                        WHERE schemaname = 'public' 
+                        AND tablename IN (
+                            'analysis_tasks', 'tenants', 'competitors', 
+                            'tenant_competitors', 'change_detection_cache', 
+                            'content_storage', 'competitor_records', 'change_detections',
+                            'monitors', 'monitor_competitors', 'change_read_receipts',
+                            'analysis_archives', 'users'
+                        )
+                    """))
+                    tables = [row[0] for row in result.fetchall()]
+                    
+                    # Drop tables in reverse dependency order
+                    for table in reversed(tables):
+                        try:
+                            conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+                            logger.info(f"已删除表: {table}")
+                        except Exception as table_error:
+                            logger.warning(f"删除表 {table} 失败: {table_error}")
+                    
+                    conn.commit()
+                    logger.info("已通过CASCADE方式删除所有表")
+                    
+            except Exception as cascade_error:
+                logger.error(f"CASCADE删除也失败: {cascade_error}")
+                raise
         
         try:
             Base.metadata.create_all(bind=engine)

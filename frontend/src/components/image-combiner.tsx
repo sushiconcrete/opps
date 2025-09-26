@@ -210,7 +210,7 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
   const [url, setUrl] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [view, setView] = useState<"form" | "results">(() => (isAuthenticated ? "results" : "form"))
+  const [view, setView] = useState<"form" | "results">(() => "form")
   const [activeCompany, setActiveCompany] = useState<string | null>(null)
   const [tenant, setTenant] = useState<TenantSnapshot | null>(null)
   const [competitorCards, setCompetitorCards] = useState<CardItem[]>([])
@@ -310,6 +310,7 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
         setCompetitorCards([])
         setChanges([])
         setTrackedCompetitorIds([])
+        setView('form')
         return
       }
 
@@ -321,11 +322,14 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
       if (preferred.latestTaskId) {
         setActiveTaskId(preferred.latestTaskId)
         await loadMonitorResults(preferred.latestTaskId)
+        setView('results')
       } else {
         setActiveTaskId(null)
         setTenant(null)
         setCompetitorCards([])
         setChanges([])
+        // User has monitors but no latest task: still show dashboard shell
+        setView('results')
       }
     } catch (err) {
       console.error('Failed to load monitors', err)
@@ -350,10 +354,18 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
     loadArchives()
   }, [loadMonitors, loadArchives])
 
+  // After successful authentication, refresh monitors/archives to decide view
   useEffect(() => {
     if (isAuthenticated) {
-      setView((current) => (current === "form" ? "results" : current))
-    } else {
+      // Optimistically show dashboard; if no monitors, loadMonitors will revert to form
+      setView('results')
+      loadMonitors()
+      loadArchives()
+    }
+  }, [isAuthenticated, loadMonitors, loadArchives])
+
+  useEffect(() => {
+    if (!isAuthenticated) {
       setView("form")
     }
   }, [isAuthenticated])
@@ -603,8 +615,20 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
   }
 
   const handleRequestMonitorCreate = () => {
+    // Redirect to landing form to perform a fresh find for the new monitor
+    streamRef.current?.cancel()
+    setError(null)
+    setIsSubmitting(false)
+    setIsLoadingMonitorResults(false)
+    setActiveCompany(null)
+    setActiveTaskId(null)
+    setTenant(null)
+    setCompetitorCards([])
+    setChanges([])
+    setTrackedCompetitorIds([])
+    setIsMonitorCreateOpen(false)
     setMonitorForm({ url: '', name: '' })
-    setIsMonitorCreateOpen(true)
+    setView('form')
   }
 
   const handleMonitorFormSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -785,7 +809,7 @@ function LandingContent({
 }: LandingContentProps) {
   return (
     <>
-      <span className="text-5xl font-mono tracking-[0.35em] text-foreground pl-2">opp_</span>
+      <span className="text-5xl font-mono tracking-[0.35em] text-foreground pl-2">opps_</span>
       <h1 className="flex flex-col text-3xl font-mono text-foreground sm:text-4xl">
         <span>Competitive Intelligence agent for</span>
         <span className="block min-h-[1.5em] text-green-500">
@@ -985,7 +1009,7 @@ function ResultsView({
     <div className="flex w-full flex-col">
       {/* Top navigation bar - full width and sticky */}
       <div className="sticky top-0 z-50 flex items-center justify-between border-b border-border bg-background/90 px-6 py-4 text-foreground backdrop-blur dark:bg-background/70">
-        <span className="-mt-1 text-3xl font-semibold tracking-[0.35em]">opp_</span>
+        <span className="-mt-1 text-3xl font-semibold tracking-[0.35em]">opps_</span>
         <div className="flex items-center gap-4 sm:gap-6">
           <MonitorDropdown
             monitors={monitors}

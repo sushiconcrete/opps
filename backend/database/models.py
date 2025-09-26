@@ -28,7 +28,7 @@ class AnalysisTask(Base):
     latest_stage = Column(String, nullable=True)
 
     user_id = Column(String, ForeignKey('users.id'), nullable=True, index=True)
-    monitor_id = Column(String, ForeignKey('monitors.id'), nullable=True, index=True)
+    monitor_id = Column(String, ForeignKey('monitors.id', name='fk_analysis_tasks_monitor_id'), nullable=True, index=True)
 
     # 关系
     competitors = relationship("CompetitorRecord", back_populates="task", cascade="all, delete-orphan")
@@ -129,7 +129,7 @@ class Monitor(Base):
     last_run_at = Column(DateTime, nullable=True)
     archived_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
-    latest_task_id = Column(String, ForeignKey('analysis_tasks.id'), nullable=True, index=True)
+    latest_task_id = Column(String, ForeignKey('analysis_tasks.id', name='fk_monitors_latest_task_id'), nullable=True, index=True)
 
     user = relationship("User", back_populates="monitors")
     tenant = relationship("Tenant")
