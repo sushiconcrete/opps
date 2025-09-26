@@ -1,7 +1,6 @@
 "use client"
 
-import { useEffect, useState, useRef } from "react"
-import type { ReactNode } from "react"
+import { useEffect, useState, useRef, useCallback, type Dispatch, type SetStateAction, type ReactNode } from "react"
 
 import { AnimatedBackground } from "@/components/animated-background"
 import ExpandableCard, { type CardItem } from "@/components/forgeui/expandable-card"
@@ -10,7 +9,30 @@ import { Scrollspy } from "@/components/ui/scrollspy"
 import { Input } from "@/components/ui/input"
 import { TypingText } from "@/components/ui/typing-text"
 import { Slider } from "@/components/ui/slider"
-import { streamMockRun, type Stage } from "@/utils/api"
+import {
+  startAnalysis,
+  streamAnalysisEvents,
+  fetchMonitors,
+  createMonitor as apiCreateMonitor,
+  deleteMonitor as apiDeleteMonitor,
+  updateMonitorName as apiUpdateMonitorName,
+  fetchAnalysisProgress,
+  markChangeRead as apiMarkChangeRead,
+  bulkMarkChangesRead as apiBulkMarkChangesRead,
+  trackCompetitor as apiTrackCompetitor,
+  untrackCompetitor as apiUntrackCompetitor,
+  fetchArchives,
+  createArchive,
+  adaptTenantStage,
+  adaptCompetitorStage,
+  adaptChangeStage,
+  type MonitorSummary,
+  type ArchiveEntry,
+  type TenantSnapshot,
+  type ChangeInsight,
+  type TrackedCompetitor,
+  type CompetitorInsight,
+} from "@/utils/api"
 import { TextShimmer } from "@/components/motion-primitives/text-shimmer"
 import {
   Dialog,
@@ -176,34 +198,9 @@ function InlineEdit({
 
 const audience = ["solo founders", "lean startups", "indie operators"]
 
-type TenantSnapshot = {
-  id: string
-  name: string
-  url: string
-  description: string
-  targetMarket: string
-  keyFeatures: string[]
-}
-
-type ChangeRadarEntry = {
-  id: string
-  url: string
-  changeType: string
-  content: string
-  timestamp: string
-  threatLevel: number
-  whyMatter: string
-  suggestions: string
-  readAt: string | null
-}
-
-type Monitor = {
-  id: string
-  name: string
-  url: string
-  createdAt: string
-}
-
+type ChangeRadarEntry = ChangeInsight
+type Monitor = MonitorSummary
+type ArchiveItem = ArchiveEntry
 type ImageCombinerProps = {
   onRequestAuth: () => void
 }
@@ -217,78 +214,208 @@ export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
   const [tenant, setTenant] = useState<TenantSnapshot | null>(null)
   const [competitorCards, setCompetitorCards] = useState<CardItem[]>([])
   const [changes, setChanges] = useState<ChangeRadarEntry[]>([])
-  const [latestStage, setLatestStage] = useState<Stage | null>(null)
   const [resultsSession, setResultsSession] = useState(0)
   const [monitors, setMonitors] = useState<Monitor[]>([])
   const [currentMonitorId, setCurrentMonitorId] = useState<string | null>(null)
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
+  const [isLoadingMonitorResults, setIsLoadingMonitorResults] = useState(false)
+  const [trackedCompetitorIds, setTrackedCompetitorIds] = useState<string[]>([])
+  const [archives, setArchives] = useState<ArchiveItem[]>([])
+  const [archivesLoading, setArchivesLoading] = useState(false)
+  const [isBulkMarkPending, setIsBulkMarkPending] = useState(false)
+  const [isMonitorCreateOpen, setIsMonitorCreateOpen] = useState(false)
+  const [isCreatingMonitor, setIsCreatingMonitor] = useState(false)
+  const [monitorForm, setMonitorForm] = useState({ url: '', name: '' })
+
+  const streamRef = useRef<{ cancel: () => void } | null>(null)
+
+  const convertMonitor = useCallback((summary: MonitorSummary): Monitor => ({
+    ...summary,
+    trackedCompetitorIds: [...summary.trackedCompetitorIds],
+    trackedCompetitorSlugs: [...summary.trackedCompetitorSlugs],
+  }), [])
+
+  const loadMonitorResults = useCallback(async (taskId?: string | null) => {
+    if (!taskId) {
+      setActiveTaskId(null)
+      setTenant(null)
+      setCompetitorCards([])
+      setChanges([])
+      setTrackedCompetitorIds([])
+      return
+    }
+
+    setIsLoadingMonitorResults(true)
+    try {
+      const events = await fetchAnalysisProgress(taskId)
+      const tenantEvent = events.find((event) => event.type === 'stage' && event.stage === 'tenant')
+      if (tenantEvent?.type === 'stage') {
+        const snapshot = adaptTenantStage(tenantEvent.data)
+        setTenant(snapshot)
+      } else {
+        setTenant(null)
+      }
+
+      const competitorsEvent = events.find((event) => event.type === 'stage' && event.stage === 'competitors')
+      if (competitorsEvent?.type === 'stage') {
+        const snapshot = adaptCompetitorStage(competitorsEvent.data)
+        const trackedSet = new Set(snapshot.trackedCompetitorIds)
+        const cards = snapshot.competitors.map((insight) =>
+          toCompetitorCard(
+            insight,
+            trackedSet.size === 0
+              ? true
+              : trackedSet.has(insight.id) || (insight.competitorId ? trackedSet.has(insight.competitorId) : false),
+          )
+        )
+        setCompetitorCards(cards)
+
+        const trackedFromStage = snapshot.trackedCompetitorIds.length
+          ? snapshot.trackedCompetitorIds
+          : cards.map((card) => card.id)
+        setTrackedCompetitorIds(trackedFromStage)
+      } else {
+        setCompetitorCards([])
+        setTrackedCompetitorIds([])
+      }
+
+      const changesEvent = events.find((event) => event.type === 'stage' && event.stage === 'changes')
+      if (changesEvent?.type === 'stage') {
+        const radar = adaptChangeStage(changesEvent.data)
+        setChanges((previous) => mergeChangeReadState(previous, radar))
+      } else {
+        setChanges([])
+      }
+
+      setActiveTaskId(taskId)
+    } catch (err) {
+      console.error('Failed to load monitor results', err)
+      setError(err instanceof Error ? err.message : 'Unable to load monitor results')
+    } finally {
+      setIsLoadingMonitorResults(false)
+    }
+  }, [])
+
+  const loadMonitors = useCallback(async () => {
+    try {
+      const summaries = await fetchMonitors()
+      const mapped = summaries.map(convertMonitor)
+      setMonitors(mapped)
+
+      if (mapped.length === 0) {
+        setCurrentMonitorId(null)
+        setActiveTaskId(null)
+        setTenant(null)
+        setCompetitorCards([])
+        setChanges([])
+        setTrackedCompetitorIds([])
+        return
+      }
+
+      const preferred = mapped.find((monitor) => monitor.id === currentMonitorId) ?? mapped[0]
+      setCurrentMonitorId(preferred.id)
+      setTrackedCompetitorIds(preferred.trackedCompetitorIds)
+      setActiveCompany(preferred.url)
+
+      if (preferred.latestTaskId) {
+        setActiveTaskId(preferred.latestTaskId)
+        await loadMonitorResults(preferred.latestTaskId)
+      } else {
+        setActiveTaskId(null)
+        setTenant(null)
+        setCompetitorCards([])
+        setChanges([])
+      }
+    } catch (err) {
+      console.error('Failed to load monitors', err)
+      setError(err instanceof Error ? err.message : 'Unable to load monitors')
+    }
+  }, [convertMonitor, currentMonitorId, loadMonitorResults])
+
+  const loadArchives = useCallback(async () => {
+    setArchivesLoading(true)
+    try {
+      const items = await fetchArchives()
+      setArchives(items)
+    } catch (err) {
+      console.error('Failed to load archives', err)
+    } finally {
+      setArchivesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadMonitors()
+    loadArchives()
+  }, [loadMonitors, loadArchives])
 
   const handleUrlChange = (value: string) => {
     setUrl(value.replace(/^https?:\/\//i, ""))
   }
 
-  const handleAddMonitor = (companyUrl: string) => {
-    const trimmedUrl = companyUrl.trim()
-    if (!trimmedUrl) return
-
-    const newMonitor: Monitor = {
-      id: `monitor-${Date.now()}`,
-      name: toDisplayName(trimmedUrl),
-      url: trimmedUrl,
-      createdAt: new Date().toISOString(),
-    }
-
-    setMonitors(prev => [...prev, newMonitor])
-    setCurrentMonitorId(newMonitor.id)
-  }
-
-  const handleDeleteMonitor = (monitorId: string) => {
-    setMonitors(prev => prev.filter(monitor => monitor.id !== monitorId))
-    
-    // If we're deleting the current monitor, switch to the first available one or go to form
-    if (currentMonitorId === monitorId) {
-      const remainingMonitors = monitors.filter(monitor => monitor.id !== monitorId)
-      if (remainingMonitors.length > 0) {
-        setCurrentMonitorId(remainingMonitors[0].id)
-        setActiveCompany(remainingMonitors[0].url)
-        // Reset other state when switching monitors
-        setTenant(null)
-        setCompetitorCards([])
-        setChanges([])
-        setLatestStage(null)
-      } else {
+  const handleDeleteMonitor = async (monitorId: string) => {
+    try {
+      await apiDeleteMonitor(monitorId)
+      if (currentMonitorId === monitorId) {
+        streamRef.current?.cancel()
         setCurrentMonitorId(null)
-        setView("form")
-        setActiveCompany(null)
+        setActiveTaskId(null)
         setTenant(null)
         setCompetitorCards([])
         setChanges([])
-        setLatestStage(null)
+        setTrackedCompetitorIds([])
       }
+      await loadMonitors()
+      await loadArchives()
+    } catch (err) {
+      console.error('Failed to delete monitor', err)
+      setError(err instanceof Error ? err.message : 'Unable to delete monitor')
     }
   }
 
-  const handleSwitchMonitor = (monitorId: string) => {
-    const monitor = monitors.find(m => m.id === monitorId)
-    if (monitor) {
-      setCurrentMonitorId(monitorId)
-      setActiveCompany(monitor.url)
-      // Reset other state when switching monitors
-      setTenant(null)
-      setCompetitorCards([])
-      setChanges([])
-      setLatestStage(null)
-      setView("results")
+  const handleSwitchMonitor = async (monitorId: string) => {
+    const monitor = monitors.find((m) => m.id === monitorId)
+    if (!monitor) {
+      setError('Selected monitor is no longer available')
+      return
+    }
+
+    streamRef.current?.cancel()
+    setCurrentMonitorId(monitorId)
+    setActiveCompany(monitor.url)
+    setTrackedCompetitorIds(monitor.trackedCompetitorIds)
+    try {
+      await loadMonitorResults(monitor.latestTaskId ?? null)
+      setView('results')
+    } catch (err) {
+      console.error('Failed to switch monitor', err)
+      setError(err instanceof Error ? err.message : 'Unable to switch monitor')
     }
   }
 
-  const handleUpdateMonitorName = (monitorId: string, newName: string) => {
-    setMonitors(prev => prev.map(monitor => 
-      monitor.id === monitorId ? { ...monitor, name: newName } : monitor
-    ))
+  const handleUpdateMonitorName = async (monitorId: string, newName: string) => {
+    try {
+      const updated = await apiUpdateMonitorName(monitorId, newName)
+      const mapped = convertMonitor(updated)
+      setMonitors((previous) => previous.map((monitor) => (monitor.id === monitorId ? mapped : monitor)))
+      if (currentMonitorId === monitorId) {
+        setActiveCompany(mapped.url)
+      }
+    } catch (err) {
+      console.error('Failed to update monitor name', err)
+      setError(err instanceof Error ? err.message : 'Unable to rename monitor')
+    }
   }
 
 
-  const handleMarkChangeRead = (changeId: string) => {
+
+  const handleMarkChangeRead = async (changeId: string) => {
+    try {
+      await apiMarkChangeRead(changeId)
+    } catch (err) {
+      console.error('Failed to mark change read', err)
+    }
+
     setChanges((previous) =>
       previous.map((change) =>
         change.id === changeId && !change.readAt
@@ -298,76 +425,219 @@ export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
     )
   }
 
+  const handleBulkMarkChangesRead = async (changeIds: string[]) => {
+    if (!changeIds.length || isBulkMarkPending) return
+    setIsBulkMarkPending(true)
+    try {
+      await apiBulkMarkChangesRead(changeIds)
+      setChanges((previous) =>
+        previous.map((change) =>
+          changeIds.includes(change.id) ? { ...change, readAt: new Date().toISOString() } : change
+        )
+      )
+    } catch (err) {
+      console.error('Failed to bulk mark changes read', err)
+      setError(err instanceof Error ? err.message : 'Unable to mark changes as read')
+    } finally {
+      setIsBulkMarkPending(false)
+    }
+  }
+
+  const handleCreateArchive = async () => {
+    if (!currentMonitorId || !activeTaskId) {
+      setError('Run an analysis before archiving')
+      return
+    }
+
+    const defaultTitle = `Archive ${new Date().toLocaleString()}`
+    const title = typeof window !== 'undefined' ? window.prompt('Archive title', defaultTitle) : defaultTitle
+    if (!title) return
+
+    try {
+      await createArchive({ monitorId: currentMonitorId, taskId: activeTaskId, title })
+      await loadArchives()
+    } catch (err) {
+      console.error('Failed to archive analysis', err)
+      setError(err instanceof Error ? err.message : 'Failed to archive analysis')
+    }
+  }
+
+
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const trimmedUrl = url.trim()
     if (!trimmedUrl) return
 
+    streamRef.current?.cancel()
     setError(null)
     setIsSubmitting(true)
+    setIsLoadingMonitorResults(true)
     setActiveCompany(trimmedUrl)
     setResultsSession((session) => session + 1)
     setView("results")
     setTenant(null)
     setCompetitorCards([])
     setChanges([])
-    setLatestStage(null)
+    setTrackedCompetitorIds([])
 
-    // Create a new monitor for this search
-    handleAddMonitor(trimmedUrl)
+    let streamIterator: AsyncIterator<any> | null = null
 
     try {
-      for await (const event of streamMockRun(`/mock/run?company=${encodeURIComponent(trimmedUrl)}`)) {
-        setLatestStage(event.stage)
+      const { taskId, monitorId } = await startAnalysis(trimmedUrl, {
+        monitorId: currentMonitorId ?? undefined,
+        tenantUrl: trimmedUrl,
+      })
 
-        if (event.stage === "tenant") {
-          const snapshot = adaptTenant(event.data)
-          if (snapshot) {
+      if (monitorId) {
+        setCurrentMonitorId(monitorId)
+        setActiveTaskId(taskId)
+      }
+
+      let cancelled = false
+      streamIterator = streamAnalysisEvents(taskId)[Symbol.asyncIterator]()
+      streamRef.current = {
+        cancel: () => {
+          cancelled = true
+          if (streamIterator?.return) {
+            streamIterator.return().catch(() => undefined)
+          }
+        },
+      }
+
+      while (!cancelled && streamIterator) {
+        const { value, done } = await streamIterator.next()
+        if (done || cancelled) {
+          break
+        }
+        const event = value
+
+        if (event.type === 'stage') {
+          if (event.stage === 'tenant') {
+            const snapshot = adaptTenantStage(event.data)
             setTenant(snapshot)
           }
-        }
-
-        if (event.stage === "competitors") {
-          const cards = adaptCompetitors(event.data)
-          if (cards.length) {
+          if (event.stage === 'competitors') {
+            const snapshot = adaptCompetitorStage(event.data)
+            const trackedSet = new Set(snapshot.trackedCompetitorIds)
+            const cards = snapshot.competitors.map((insight) =>
+              toCompetitorCard(
+                insight,
+                trackedSet.size === 0
+                  ? true
+                  : trackedSet.has(insight.id) || (insight.competitorId ? trackedSet.has(insight.competitorId) : false),
+              )
+            )
             setCompetitorCards(cards)
-          }
-        }
 
-        if (event.stage === "changes") {
-          const radar = adaptChanges(event.data)
-          if (radar.length) {
+            const trackedFromStage = snapshot.trackedCompetitorIds.length
+              ? snapshot.trackedCompetitorIds
+              : cards.map((card) => card.id)
+            setTrackedCompetitorIds(trackedFromStage)
+          }
+          if (event.stage === 'changes') {
+            const radar = adaptChangeStage(event.data)
             setChanges((previous) => {
-              const previousById = new Map(previous.map((entry) => [entry.id, entry]))
-              return radar.map((entry) => {
-                const existing = previousById.get(entry.id)
-                return existing ? { ...entry, readAt: existing.readAt } : entry
-              })
+              return mergeChangeReadState(previous, radar)
             })
+          }
+        } else if (event.type === 'status') {
+          if (event.stage === 'failed') {
+            setError(event.message ?? 'Analysis failed')
+            break
+          }
+          if (event.stage === 'complete') {
+            setActiveTaskId(taskId)
+            await loadMonitors()
+            await loadArchives()
+            break
           }
         }
       }
     } catch (err) {
       console.error(err)
-      setError("Something went wrong while streaming the run.")
+      setError(err instanceof Error ? err.message : 'Something went wrong while streaming the run.')
     } finally {
+      if (streamIterator?.return) {
+        try {
+          await streamIterator.return()
+        } catch {
+          // ignore
+        }
+      }
       setIsSubmitting(false)
+      setIsLoadingMonitorResults(false)
+      streamRef.current = null
     }
   }
 
   const handleBackToForm = () => {
+    streamRef.current?.cancel()
+    streamRef.current = null
     setView("form")
     setError(null)
     setIsSubmitting(false)
+    setIsLoadingMonitorResults(false)
     setActiveCompany(null)
+    setActiveTaskId(null)
     setTenant(null)
     setCompetitorCards([])
     setChanges([])
-    setLatestStage(null)
+    setTrackedCompetitorIds([])
+  }
+
+  const handleRequestMonitorCreate = () => {
+    setMonitorForm({ url: '', name: '' })
+    setIsMonitorCreateOpen(true)
+  }
+
+  const handleMonitorFormSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const trimmedUrl = monitorForm.url.trim()
+    if (!trimmedUrl) {
+      setError('Monitor URL is required')
+      return
+    }
+
+    setIsCreatingMonitor(true)
+    try {
+      const absoluteUrl = ensureAbsoluteUrl(trimmedUrl)
+      const response = await apiCreateMonitor({
+        url: absoluteUrl,
+        name: monitorForm.name.trim() || undefined,
+      })
+
+      const mapped = convertMonitor(response)
+      setMonitors((previous) => {
+        const filtered = previous.filter((monitor) => monitor.id !== mapped.id)
+        return [mapped, ...filtered]
+      })
+
+      setCurrentMonitorId(mapped.id)
+      setTrackedCompetitorIds(mapped.trackedCompetitorIds)
+      setActiveCompany(mapped.url)
+      setActiveTaskId(mapped.latestTaskId ?? null)
+      setTenant(null)
+      setCompetitorCards([])
+      setChanges([])
+
+      if (mapped.latestTaskId) {
+        await loadMonitorResults(mapped.latestTaskId)
+      }
+
+      setView('results')
+      setIsMonitorCreateOpen(false)
+      setMonitorForm({ url: '', name: '' })
+    } catch (err) {
+      console.error('Failed to create monitor', err)
+      setError(err instanceof Error ? err.message : 'Unable to create monitor')
+    } finally {
+      setIsCreatingMonitor(false)
+    }
   }
 
   return (
+    <>
     <div
       className={`relative flex min-h-screen w-full flex-col ${
         view === "form"
@@ -406,23 +676,46 @@ export function ImageCombiner({ onRequestAuth }: ImageCombinerProps) {
           key={resultsSession}
           companyUrl={activeCompany}
           isSubmitting={isSubmitting}
+          isLoadingMonitorResults={isLoadingMonitorResults}
           error={error}
           onBack={handleBackToForm}
           tenant={tenant}
           competitors={competitorCards}
+          setCompetitors={setCompetitorCards}
           changes={changes}
-          latestStage={latestStage}
           onMarkChangeRead={handleMarkChangeRead}
+          onBulkMarkChangesRead={handleBulkMarkChangesRead}
           resetToken={resultsSession}
           monitors={monitors}
           currentMonitorId={currentMonitorId}
+          archives={archives}
+          archivesLoading={archivesLoading}
+          trackedCompetitorIds={trackedCompetitorIds}
+          isBulkMarkPending={isBulkMarkPending}
+          onCreateArchive={handleCreateArchive}
           onSwitchMonitor={handleSwitchMonitor}
           onDeleteMonitor={handleDeleteMonitor}
-          onAddMonitor={() => setView("form")}
+          onAddMonitor={handleRequestMonitorCreate}
           onUpdateMonitorName={handleUpdateMonitorName}
+          setError={setError}
+          setTrackedCompetitorIds={setTrackedCompetitorIds}
         />
       )}
     </div>
+      <MonitorCreateDialog
+        open={isMonitorCreateOpen}
+        isSubmitting={isCreatingMonitor}
+        form={monitorForm}
+        onOpenChange={(open) => {
+          setIsMonitorCreateOpen(open)
+          if (!open) {
+            setMonitorForm({ url: '', name: '' })
+          }
+        }}
+        onChange={setMonitorForm}
+        onSubmit={handleMonitorFormSubmit}
+      />
+    </>
   )
 }
 
@@ -513,92 +806,142 @@ function LandingContent({
 type ResultsViewProps = {
   companyUrl: string | null
   isSubmitting: boolean
+  isLoadingMonitorResults: boolean
   error: string | null
   onBack: () => void
   tenant: TenantSnapshot | null
   competitors: CardItem[]
+  setCompetitors: Dispatch<SetStateAction<CardItem[]>>
   changes: ChangeRadarEntry[]
-  latestStage: Stage | null
   onMarkChangeRead: (id: string) => void
+  onBulkMarkChangesRead: (ids: string[]) => void
   resetToken: number
   monitors: Monitor[]
   currentMonitorId: string | null
+  archives: ArchiveItem[]
+  archivesLoading: boolean
+  trackedCompetitorIds: string[]
+  isBulkMarkPending: boolean
+  onCreateArchive: () => void
   onSwitchMonitor: (monitorId: string) => void
   onDeleteMonitor: (monitorId: string) => void
   onAddMonitor: () => void
   onUpdateMonitorName: (monitorId: string, newName: string) => void
+  setError: (message: string | null) => void
+  setTrackedCompetitorIds: Dispatch<SetStateAction<string[]>>
 }
 
 function ResultsView({
   companyUrl,
   isSubmitting,
+  isLoadingMonitorResults,
   error,
   tenant,
   competitors,
+  setCompetitors,
   changes,
-  latestStage,
   onMarkChangeRead,
+  onBulkMarkChangesRead,
   resetToken,
   monitors,
   currentMonitorId,
+  archives,
+  archivesLoading,
+  trackedCompetitorIds,
+  isBulkMarkPending,
+  onCreateArchive,
   onSwitchMonitor,
   onDeleteMonitor,
   onAddMonitor,
   onUpdateMonitorName,
+  setError,
+  setTrackedCompetitorIds,
 }: ResultsViewProps) {
   const [isAddCompetitorOpen, setIsAddCompetitorOpen] = useState(false)
   const [competitorUrl, setCompetitorUrl] = useState("")
-  const [competitorCards, setCompetitorCards] = useState<CardItem[]>(competitors)
+  const [isSavingCompetitor, setIsSavingCompetitor] = useState(false)
 
   const displayName = companyUrl ? toDisplayName(companyUrl) : "your company"
   const stageReady = {
     tenant: Boolean(tenant),
-    competitors: competitorCards.length > 0,
+    competitors: competitors.length > 0,
     changes: changes.length > 0,
   }
   const unreadCount = changes.reduce((count, change) => (change.readAt ? count : count + 1), 0)
 
-  // Update competitor cards when competitors prop changes
-  useEffect(() => {
-    setCompetitorCards(competitors)
-  }, [competitors])
-
   /**
    * Handles adding a new competitor manually via the dialog form
    */
-  const handleAddCompetitor = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleAddCompetitor = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const trimmedUrl = competitorUrl.trim()
-    if (!trimmedUrl) return
-
-    // Create a new competitor card with proper formatting
-    const newCompetitor: CardItem = {
-      id: `competitor-${Date.now()}`,
-      title: toDisplayName(trimmedUrl),
-      subtitle: formatDisplayUrl(trimmedUrl),
-      icon: <CompetitorIcon domain={domainForFavicon(trimmedUrl)} name={toDisplayName(trimmedUrl)} />,
-      description: "Added manually",
-      details: "Competitor added by user",
-      metadata: "Manual entry",
-      extended: [
-        { label: "URL", value: formatDisplayUrl(trimmedUrl) },
-        { label: "Source", value: "Manual" },
-        { label: "Added", value: new Date().toLocaleDateString() },
-      ],
-      link: trimmedUrl.startsWith("http") ? trimmedUrl : `https://${trimmedUrl}`,
+    if (!trimmedUrl || !currentMonitorId) {
+      setError('Select a monitor and provide a competitor URL before adding')
+      return
     }
 
-    // Add the new competitor to the list and reset form
-    setCompetitorCards((previous) => [...previous, newCompetitor])
-    setCompetitorUrl("")
-    setIsAddCompetitorOpen(false)
+    const absoluteUrl = ensureAbsoluteUrl(trimmedUrl)
+    const competitorId = extractCompetitorId(absoluteUrl)
+    setIsSavingCompetitor(true)
+
+    try {
+      const response = await apiTrackCompetitor(competitorId, {
+        monitorId: currentMonitorId,
+        displayName: toDisplayName(absoluteUrl),
+        url: absoluteUrl,
+        source: 'manual',
+        description: 'Added manually',
+      })
+
+      const insight = response.competitor
+        ? insightFromTracked(response.competitor)
+        : {
+            id: competitorId,
+            competitorId,
+            displayName: toDisplayName(absoluteUrl),
+            primaryUrl: absoluteUrl,
+            briefDescription: 'Added manually',
+            source: 'manual',
+            confidence: 0.5,
+            demographics: 'Undisclosed audience',
+          }
+
+      setCompetitors((previous) => {
+        const filtered = previous.filter((item) => item.id !== insight.id)
+        return [toCompetitorCard(insight), ...filtered]
+      })
+
+      setTrackedCompetitorIds((previous) =>
+        response.trackedCompetitorIds.length
+          ? response.trackedCompetitorIds
+          : Array.from(new Set([...previous, insight.id]))
+      )
+
+      setCompetitorUrl('')
+      setIsAddCompetitorOpen(false)
+    } catch (err) {
+      console.error('Failed to add competitor', err)
+      setError(err instanceof Error ? err.message : 'Unable to add competitor')
+    } finally {
+      setIsSavingCompetitor(false)
+    }
   }
 
   /**
    * Handles removing a competitor from the list
    */
-  const handleRemoveCompetitor = (competitorId: string) => {
-    setCompetitorCards((previous) => previous.filter(competitor => competitor.id !== competitorId))
+  const handleRemoveCompetitor = async (competitorId: string) => {
+    if (currentMonitorId) {
+      try {
+        const response = await apiUntrackCompetitor(competitorId, { monitorId: currentMonitorId })
+        setTrackedCompetitorIds(response.trackedCompetitorIds)
+      } catch (err) {
+        console.error('Failed to untrack competitor', err)
+        setError(err instanceof Error ? err.message : 'Unable to untrack competitor')
+      }
+    }
+
+    setCompetitors((previous) => previous.filter(competitor => competitor.id !== competitorId))
   }
 
   useEffect(() => {
@@ -618,6 +961,7 @@ function ResultsView({
     { id: "section-profile", label: "Profile" },
     { id: "section-competitors", label: "Competitors" },
     { id: "section-radar", label: unreadCount ? `Radar (${unreadCount})` : "Radar" },
+    { id: "section-archives", label: "Archives" },
     { id: "section-mcp", label: "MCP Integration" },
   ]
 
@@ -684,29 +1028,41 @@ function ResultsView({
               <TenantPanel
                 tenant={tenant}
                 displayName={displayName}
-                isLoading={isSubmitting && !stageReady.tenant}
+                isLoading={(isSubmitting || isLoadingMonitorResults) && !stageReady.tenant}
               />
             </section>
 
             <section id="section-competitors" className="scroll-mt-24">
               <CompetitorsPanel
-                competitors={competitorCards}
-                isLoading={isSubmitting && !stageReady.competitors && (latestStage === null || latestStage === "tenant" || latestStage === "competitors")}
+                competitors={competitors}
+                isLoading={(isSubmitting || isLoadingMonitorResults) && !stageReady.competitors}
                 isAddCompetitorOpen={isAddCompetitorOpen}
                 setIsAddCompetitorOpen={setIsAddCompetitorOpen}
                 competitorUrl={competitorUrl}
                 setCompetitorUrl={setCompetitorUrl}
                 onAddCompetitor={handleAddCompetitor}
                 onRemoveCompetitor={handleRemoveCompetitor}
+                trackedCompetitorIds={trackedCompetitorIds}
+                isSaving={isSavingCompetitor}
               />
             </section>
 
             <section id="section-radar" className="scroll-mt-24">
               <ChangesPanel
                 changes={changes}
-                isLoading={isSubmitting && !stageReady.changes}
+                isLoading={(isSubmitting || isLoadingMonitorResults) && !stageReady.changes}
                 onMarkRead={onMarkChangeRead}
+                onBulkMarkRead={onBulkMarkChangesRead}
                 unreadCount={unreadCount}
+                isBulkActionPending={isBulkMarkPending}
+              />
+            </section>
+
+            <section id="section-archives" className="scroll-mt-24">
+              <ArchivePanel
+                archives={archives}
+                isLoading={archivesLoading}
+                onCreateArchive={onCreateArchive}
               />
             </section>
 
@@ -715,7 +1071,7 @@ function ResultsView({
             </section>
 
             {isSubmitting && (
-              <p className="text-sm text-muted-foreground">Streaming mock run output...</p>
+              <p className="text-sm text-muted-foreground">Processing analysis stream...</p>
             )}
 
             {error && (
@@ -972,6 +1328,8 @@ type CompetitorsPanelProps = {
   setCompetitorUrl: (url: string) => void
   onAddCompetitor: (event: React.FormEvent<HTMLFormElement>) => void
   onRemoveCompetitor: (id: string) => void
+  trackedCompetitorIds: string[]
+  isSaving: boolean
 }
 
 function CompetitorsPanel({ 
@@ -982,13 +1340,21 @@ function CompetitorsPanel({
   competitorUrl, 
   setCompetitorUrl, 
   onAddCompetitor,
-  onRemoveCompetitor
+  onRemoveCompetitor,
+  trackedCompetitorIds,
+  isSaving,
 }: CompetitorsPanelProps) {
+  const trackedCount = trackedCompetitorIds.length
+  const surfacedCount = competitors.length
+  const description = surfacedCount
+    ? `${surfacedCount} competitors surfaced · ${trackedCount} tracked`
+    : 'No competitors found'
+
   return (
     <StageCard
       title="Competitors"
       cardClassName="relative"
-      description={competitors.length ? `${competitors.length} competitors surfaced` : "No competitors found"}
+      description={description}
     >
       <div className="space-y-4">
         {competitors.length ? (
@@ -1013,7 +1379,8 @@ function CompetitorsPanel({
               <Button 
                 variant="outline" 
                 className="border-border text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={isLoading}
+                disabled={isLoading || isSaving}
+                isLoading={isSaving}
               >
                 Add Competitor
               </Button>
@@ -1059,18 +1426,93 @@ function CompetitorsPanel({
   )
 }
 
+type MonitorCreateDialogProps = {
+  open: boolean
+  isSubmitting: boolean
+  form: { url: string; name: string }
+  onOpenChange: (open: boolean) => void
+  onChange: (form: { url: string; name: string }) => void
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
+}
+
+function MonitorCreateDialog({
+  open,
+  isSubmitting,
+  form,
+  onOpenChange,
+  onChange,
+  onSubmit,
+}: MonitorCreateDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-[480px] border border-border bg-popover text-popover-foreground">
+        <form onSubmit={onSubmit}>
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Add Monitor</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Create a monitor to track future analyses for this domain.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            <div className="grid gap-2">
+              <Label htmlFor="monitor-url" className="text-foreground">
+                Website URL
+              </Label>
+              <Input
+                id="monitor-url"
+                value={form.url}
+                onChange={(event) => onChange({ ...form, url: event.target.value })}
+                placeholder="https://example.com"
+                className="border border-input bg-background text-foreground placeholder:text-muted-foreground"
+                autoFocus
+                required
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="monitor-name" className="text-foreground">
+                Monitor name (optional)
+              </Label>
+              <Input
+                id="monitor-name"
+                value={form.name}
+                onChange={(event) => onChange({ ...form, name: event.target.value })}
+                placeholder="Acme homepage"
+                className="border border-input bg-background text-foreground placeholder:text-muted-foreground"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="outline" className="border-border text-foreground hover:bg-accent">
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button type="submit" className="bg-primary text-primary-foreground hover:bg-primary/90" isLoading={isSubmitting}>
+              Create monitor
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 type ChangesPanelProps = {
   changes: ChangeRadarEntry[]
   isLoading: boolean
-  onMarkRead: (id: string) => void
+  onMarkRead: (id: string) => Promise<void> | void
+  onBulkMarkRead?: (ids: string[]) => Promise<void> | void
   unreadCount: number
+  isBulkActionPending: boolean
 }
 
 function ChangesPanel({
   changes,
   isLoading,
   onMarkRead,
+  onBulkMarkRead,
   unreadCount,
+  isBulkActionPending,
 }: ChangesPanelProps) {
   const [searchQuery, setSearchQuery] = useState("")
   const [searchPage, setSearchPage] = useState(0)
@@ -1150,9 +1592,16 @@ function ChangesPanel({
     setIsSelectionMode(false)
   }
   
-  const handleBulkMarkRead = () => {
-    selectedChanges.forEach(changeId => onMarkRead(changeId))
+  const handleBulkMarkRead = async () => {
+    if (!selectedChanges.size || isBulkActionPending) return
+    const ids = Array.from(selectedChanges)
+    if (onBulkMarkRead) {
+      await onBulkMarkRead(ids)
+    } else {
+      await Promise.all(ids.map((changeId) => Promise.resolve(onMarkRead(changeId))))
+    }
     setSelectedChanges(new Set())
+    setIsSelectionMode(false)
   }
   
   const isAllSelected = visibleFilteredChanges.length > 0 && 
@@ -1323,6 +1772,8 @@ function ChangesPanel({
                           size="sm"
                           onClick={handleBulkMarkRead}
                           className="h-8 px-3 text-xs border-border text-foreground hover:bg-accent"
+                          disabled={isBulkActionPending}
+                          isLoading={isBulkActionPending}
                         >
                           Mark as read ({selectedChanges.size})
                         </Button>
@@ -1346,6 +1797,7 @@ function ChangesPanel({
                       variant="ghost"
                       size="sm"
                       onClick={() => setIsSelectionMode(true)}
+                      disabled={isBulkActionPending}
                       className="h-8 px-3 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
                     >
                       Select items
@@ -1394,6 +1846,73 @@ function ChangesPanel({
       </StageCard>
     </Drawer>
   )
+}
+
+function toCompetitorCard(insight: CompetitorInsight, isTracked = true): CardItem {
+  const displayUrl = formatDisplayUrl(insight.primaryUrl)
+  const confidencePercent = Math.round((insight.confidence ?? 0.5) * 100)
+  const domain = domainForFavicon(insight.primaryUrl)
+  const metadata = isTracked
+    ? insight.demographics
+    : `${insight.demographics || 'Undisclosed audience'} · untracked`
+
+  return {
+    id: insight.id,
+    title: insight.displayName,
+    subtitle: displayUrl,
+    icon: <CompetitorIcon domain={domain} name={insight.displayName} />,
+    description: `Confidence: ${confidencePercent}% · Source: ${insight.source}`,
+    details: insight.briefDescription,
+    metadata,
+    extended: [
+      { label: 'Primary URL', value: displayUrl || 'Not published' },
+      { label: 'Audience', value: insight.demographics || 'Undisclosed audience' },
+      { label: 'Signal source', value: insight.source || 'analysis' },
+      { label: 'Confidence score', value: `${confidencePercent}%` },
+    ],
+    link: insight.primaryUrl || undefined,
+  }
+}
+
+function mergeChangeReadState(
+  previous: ChangeRadarEntry[],
+  next: ChangeInsight[],
+): ChangeRadarEntry[] {
+  const previousById = new Map(previous.map((entry) => [entry.id, entry]))
+  return next.map((entry) => {
+    const existing = previousById.get(entry.id)
+    return existing ? { ...entry, readAt: existing.readAt ?? entry.readAt } : entry
+  })
+}
+
+function insightFromTracked(record: TrackedCompetitor): CompetitorInsight {
+  return {
+    id: record.id,
+    competitorId: record.competitorId,
+    displayName: record.displayName,
+    primaryUrl: record.primaryUrl,
+    briefDescription: record.briefDescription || 'Added manually',
+    source: record.source || 'analysis',
+    confidence: record.confidence ?? 0.5,
+    demographics: record.demographics || 'Undisclosed audience',
+  }
+}
+
+function ensureAbsoluteUrl(raw: string): string {
+  if (!raw) return ''
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw
+  }
+  return `https://${raw}`
+}
+
+function extractCompetitorId(rawUrl: string): string {
+  try {
+    const url = new URL(ensureAbsoluteUrl(rawUrl))
+    return url.hostname.replace(/^www\./, '') || rawUrl
+  } catch {
+    return rawUrl.replace(/^https?:\/\//, '').split('/')[0] || rawUrl
+  }
 }
 
 type StageCardProps = {
@@ -1474,6 +1993,54 @@ function McpPanel() {
   )
 }
 
+type ArchivePanelProps = {
+  archives: ArchiveItem[]
+  isLoading: boolean
+  onCreateArchive: () => void
+}
+
+function ArchivePanel({ archives, isLoading, onCreateArchive }: ArchivePanelProps) {
+  return (
+    <StageCard
+      title="Archive"
+      description={archives.length ? `${archives.length} saved snapshots` : 'Capture completed analyses'}
+      headerActions={
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 px-3 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+          onClick={onCreateArchive}
+        >
+          Save snapshot
+        </Button>
+      }
+    >
+      {isLoading ? (
+        <StagePlaceholder message="Fetching archives..." isLoading={true} />
+      ) : archives.length ? (
+        <div className="space-y-3">
+          {archives.map((archive) => (
+            <div
+              key={archive.id}
+              className="rounded-lg border border-border bg-card/70 px-4 py-3 text-left text-sm text-foreground"
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-medium">{archive.title}</span>
+                <span className="text-xs text-muted-foreground">{formatTimestamp(archive.createdAt)}</span>
+              </div>
+              {archive.metadata && archive.metadata.summary ? (
+                <p className="mt-2 text-xs text-muted-foreground">{String(archive.metadata.summary)}</p>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <StagePlaceholder message="No archives yet. Save the current run to build your history." isLoading={false} />
+      )}
+    </StageCard>
+  )
+}
+
 type StagePlaceholderProps = {
   message: string
   isLoading: boolean
@@ -1517,7 +2084,7 @@ function InfoTile({ label, value }: InfoTileProps) {
 
 function adaptChangesToCards(
   changes: ChangeRadarEntry[], 
-  onMarkRead: (id: string) => void,
+  onMarkRead: (id: string) => Promise<void> | void,
   selectedChanges: Set<string>,
   onSelectChange: (changeId: string, isSelected: boolean) => void,
   isSelectionMode: boolean
@@ -1554,104 +2121,6 @@ function adaptChangesToCards(
   })
 }
 
-function adaptTenant(data: unknown): TenantSnapshot | null {
-  if (!data || typeof data !== "object") return null
-  const record = data as Record<string, unknown>
-
-  const name = stringOrFallback(record.tenant_name, "Unknown company")
-  const url = stringOrFallback(record.tenant_url, "https://example.com")
-  const description = stringOrFallback(
-    record.tenant_description,
-    `${name} overview pending.`
-  )
-  const targetMarket = stringOrFallback(record.target_market, "Market pending")
-  const keyFeaturesRaw = Array.isArray(record.key_features) ? record.key_features : []
-  const keyFeatures = keyFeaturesRaw
-    .filter((feature): feature is string => typeof feature === "string")
-    .map((feature) => feature.trim())
-    .filter(Boolean)
-
-  return {
-    id: stringOrFallback(record.tenant_id, "unknown"),
-    name,
-    url,
-    description,
-    targetMarket,
-    keyFeatures,
-  }
-}
-
-function adaptCompetitors(data: unknown): CardItem[] {
-  if (!data || typeof data !== "object") return []
-  const payload = data as Record<string, unknown>
-  const list = Array.isArray(payload.competitors) ? payload.competitors : []
-
-  return list
-    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-    .slice(0, 10)
-    .map((competitor, index) => {
-      const name = stringOrFallback(competitor.display_name ?? competitor.name, `Competitor ${index + 1}`)
-      const url = stringOrFallback(competitor.primary_url ?? competitor.url, "")
-      const description = stringOrFallback(
-        competitor.brief_description ?? competitor.description,
-        "No briefing yet."
-      )
-      const source = stringOrFallback(competitor.source, "search")
-      const confidenceRaw = typeof competitor.confidence === "number" ? competitor.confidence : 0.5
-      const confidence = Math.round(confidenceRaw * 100)
-      const demographics = stringOrFallback(competitor.demographics ?? competitor.target_users, "Undisclosed audience")
-      const faviconDomain = domainForFavicon(url)
-
-      return {
-        id: stringOrFallback(competitor.id, `${name}-${index}`),
-        title: name,
-        subtitle: formatDisplayUrl(url) || source,
-        icon: (
-          <CompetitorIcon
-            domain={faviconDomain}
-            name={name}
-          />
-        ),
-        description: `Confidence: ${confidence}% · Source: ${source}`,
-        details: description,
-        metadata: demographics,
-        extended: [
-          { label: "Primary URL", value: formatDisplayUrl(url) || "Not published" },
-          { label: "Audience", value: demographics },
-          { label: "Signal source", value: source },
-          { label: "Confidence score", value: `${confidence}%` },
-        ],
-        link: url || undefined,
-      }
-    })
-}
-
-function adaptChanges(data: unknown): ChangeRadarEntry[] {
-  if (!data || typeof data !== "object") return []
-  const payload = data as Record<string, unknown>
-  const list = Array.isArray(payload.changes) ? payload.changes : []
-
-  return list
-    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-    .map((entry, index) => ({
-      id: stringOrFallback(entry.id, `change-${index}`),
-      url: stringOrFallback(entry.url, "https://example.com"),
-      changeType: stringOrFallback(entry.change_type, "Modified"),
-      content: stringOrFallback(entry.content, "Details pending"),
-      timestamp: stringOrFallback(entry.timestamp, new Date().toISOString()),
-      threatLevel: typeof entry.threat_level === "number" ? entry.threat_level : 5,
-      whyMatter: stringOrFallback(entry.why_matter, "Impact assessment pending"),
-      suggestions: stringOrFallback(entry.suggestions, "Review with GTM team"),
-      readAt: typeof entry.read_at === "string" && entry.read_at.trim() ? entry.read_at : null,
-    }))
-}
-
-function stringOrFallback(value: unknown, fallback: string): string {
-  if (typeof value === "string" && value.trim()) {
-    return value.trim()
-  }
-  return fallback
-}
 
 function toDisplayName(companyUrl: string): string {
   try {

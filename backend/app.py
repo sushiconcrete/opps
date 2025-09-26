@@ -42,9 +42,9 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'  # 允许开发环境使用HTTP
 
 # ========== FastAPI和OAuth相关导入 ==========
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List, Set, Any
 import uuid
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -78,7 +78,11 @@ from database import (
     tenant_crud,
     enhanced_task_crud,
     change_detection_cache,
-    get_database_stats
+    get_database_stats,
+    monitor_crud,
+    monitor_competitor_crud,
+    change_read_crud,
+    archive_crud
 )
 
 # ========== OAuth 配置 ==========
@@ -102,6 +106,67 @@ logger = logging.getLogger(__name__)
 # ========== JWT 认证函数 ==========
 security = HTTPBearer()
 
+class TaskEventBroker:
+    """In-memory broker for streaming analysis events"""
+
+    def __init__(self) -> None:
+        self._subscribers: Dict[str, Set[asyncio.Queue]] = {}
+        self._history: Dict[str, List[dict]] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, task_id: str) -> asyncio.Lock:
+        lock = self._locks.get(task_id)
+        if not lock:
+            lock = asyncio.Lock()
+            self._locks[task_id] = lock
+        return lock
+
+    async def subscribe(self, task_id: str) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        async with self._get_lock(task_id):
+            subscribers = self._subscribers.setdefault(task_id, set())
+            subscribers.add(queue)
+            history = list(self._history.get(task_id, []))
+
+        for event in history:
+            await queue.put(event)
+
+        return queue
+
+    async def unsubscribe(self, task_id: str, queue: asyncio.Queue) -> None:
+        async with self._get_lock(task_id):
+            subscribers = self._subscribers.get(task_id)
+            if not subscribers:
+                return
+            subscribers.discard(queue)
+            if not subscribers:
+                self._subscribers.pop(task_id, None)
+                self._history.pop(task_id, None)
+                self._locks.pop(task_id, None)
+
+    async def publish(self, task_id: str, event: dict) -> None:
+        async with self._get_lock(task_id):
+            subscribers = list(self._subscribers.get(task_id, []))
+            history = self._history.setdefault(task_id, [])
+            history.append(event)
+            if len(history) > 50:
+                history.pop(0)
+
+        if not subscribers:
+            return
+
+        for queue in subscribers:
+            await queue.put(event)
+
+    def prime(self, task_id: str, events: List[dict]) -> None:
+        self._history[task_id] = list(events[-50:])
+
+    def get_history(self, task_id: str) -> List[dict]:
+        return list(self._history.get(task_id, []))
+
+
+event_broker = TaskEventBroker()
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """创建JWT访问令牌"""
     to_encode = data.copy()
@@ -120,10 +185,62 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Authentication required")
+        ensure_user_record(payload)
         return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please sign in again."
+        ) from exc
+
+
+require_auth = verify_token
+
+
+def ensure_user_record(payload: dict) -> None:
+    """Make sure a decoded JWT payload maps to a persisted user."""
+    user_id = payload.get("sub")
+    if not user_id:
+        return
+
+    try:
+        from database.models import User
+        with get_db_session() as db_session:
+            user = db_session.query(User).filter(User.id == user_id).first()
+            now = datetime.now(timezone.utc)
+
+            if user:
+                user.last_login = now
+                email = payload.get("email")
+                if email and user.email != email:
+                    user.email = email
+                name = payload.get("name")
+                if name and user.name != name:
+                    user.name = name
+                avatar = payload.get("picture") or payload.get("avatar_url")
+                if avatar and user.avatar_url != avatar:
+                    user.avatar_url = avatar
+                return
+
+            email = payload.get("email") or f"{user_id}@placeholder.local"
+            name = payload.get("name") or (email.split("@", 1)[0] if "@" in email else "User")
+            avatar_url = payload.get("picture") or payload.get("avatar_url")
+
+            new_user = User(
+                id=user_id,
+                email=email,
+                name=name or "User",
+                avatar_url=avatar_url,
+                is_active=True,
+                is_verified=bool(payload.get("email_verified")),
+                created_at=now,
+                updated_at=now,
+                last_login=now
+            )
+            db_session.add(new_user)
+    except Exception as exc:
+        logger.warning(f"Failed to ensure user record for {user_id}: {exc}")
 
 def create_google_oauth_flow():
     """创建Google OAuth流程 - 修复版本"""
@@ -246,10 +363,84 @@ class AnalysisRequest(BaseModel):
     enable_research: bool = True
     max_competitors: int = 10
     enable_caching: bool = True
+    monitor_id: Optional[str] = None
+    monitor_name: Optional[str] = None
+    tenant_url: Optional[str] = None
 
 class TaskResponse(BaseModel):
     task_id: str
     message: str
+    monitor_id: Optional[str] = None
+
+class MonitorCreateRequest(BaseModel):
+    url: str
+    name: Optional[str] = None
+
+class MonitorRenameRequest(BaseModel):
+    name: str
+
+class CompetitorTrackRequest(BaseModel):
+    monitor_id: Optional[str] = None
+    display_name: Optional[str] = None
+    url: Optional[str] = None
+    source: Optional[str] = None
+    description: Optional[str] = None
+    confidence: Optional[float] = None
+
+class BulkReadRequest(BaseModel):
+    change_ids: List[str]
+    monitor_id: Optional[str] = None
+
+class ArchiveCreateRequest(BaseModel):
+    monitor_id: Optional[str] = None
+    task_id: Optional[str] = None
+    title: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+def serialize_monitor(monitor) -> Dict[str, Any]:
+    latest_task = getattr(monitor, 'latest_task', None)
+    tracked_records = list(getattr(monitor, 'tracked_competitors', []) or [])
+    tracked_ids: List[str] = []
+    tracked_slugs: List[str] = []
+
+    for record in tracked_records:
+        competitor_pk = getattr(record, 'competitor_id', None)
+        if competitor_pk:
+            tracked_ids.append(competitor_pk)
+        competitor_obj = getattr(record, 'competitor', None)
+        competitor_slug = getattr(competitor_obj, 'competitor_id', None) if competitor_obj else None
+        if competitor_slug:
+            tracked_slugs.append(competitor_slug)
+
+    return {
+        'id': monitor.id,
+        'name': monitor.name,
+        'url': monitor.url,
+        'created_at': monitor.created_at,
+        'updated_at': getattr(monitor, 'updated_at', None),
+        'last_run_at': monitor.last_run_at,
+        'latest_task_id': monitor.latest_task_id,
+        'latest_task_status': getattr(latest_task, 'status', None),
+        'latest_task_progress': getattr(latest_task, 'progress', None),
+        'archived_at': monitor.archived_at,
+        'tracked_competitor_ids': tracked_ids,
+        'tracked_competitor_slugs': tracked_slugs
+    }
+
+
+def serialize_archive(archive) -> Dict[str, Any]:
+    return {
+        'id': archive.id,
+        'monitor_id': archive.monitor_id,
+        'task_id': archive.task_id,
+        'title': archive.title,
+        'created_at': archive.created_at,
+        'tenant': archive.tenant_snapshot,
+        'competitors': archive.competitor_snapshot,
+        'changes': archive.change_snapshot,
+        'metadata': archive.metadata_json
+    }
 
 class StatusResponse(BaseModel):
     task_id: str
@@ -408,17 +599,31 @@ class CompetitorIDManager:
 
 # ========== 修复后的主分析函数 ==========
 async def run_analysis_with_persistence(
-    task_id: str, 
-    company_name: str, 
-    enable_research: bool, 
-    max_competitors: int, 
+    task_id: str,
+    company_name: str,
+    enable_research: bool,
+    max_competitors: int,
     enable_caching: bool,
-    db: Session
+    db: Session,
+    user_id: Optional[str] = None,
+    monitor_id: Optional[str] = None
 ):
     """运行分析任务（异步）- 使用统一的ID管理系统"""
     cached_results = {}
     uncached_competitors = []
-    
+
+    analysis_context: Dict[str, Any] = {
+        "tenant": None,
+        "competitors": [],
+        "changes": []
+    }
+
+    async def emit(event: Dict[str, Any]) -> None:
+        try:
+            await event_broker.publish(task_id, event)
+        except Exception as publish_error:
+            logger.warning(f'Failed to publish event for {task_id}: {publish_error}')
+
     try:
         logger.info(f"开始分析任务: {company_name} (缓存: {'启用' if enable_caching else '禁用'})")
         
@@ -427,6 +632,13 @@ async def run_analysis_with_persistence(
             progress=10,
             message="Initializing analysis components..."
         )
+        
+        await emit({
+            "type": "status",
+            "stage": "initializing",
+            "progress": 10,
+            "message": "Initializing analysis components..."
+        })
         
         components = get_analyzer_components()
         tenant_agent = components['tenant_agent']
@@ -450,6 +662,8 @@ async def run_analysis_with_persistence(
         
         # 保存租户信息到数据库
         tenant_id = None
+        tenant_payload: Dict[str, Any] = {}
+        saved_tenant = None
         try:
             with get_db_session() as db_session:
                 if hasattr(tenant, 'model_dump'):
@@ -458,20 +672,47 @@ async def run_analysis_with_persistence(
                     tenant_dict = tenant.__dict__
                 else:
                     tenant_dict = dict(tenant) if hasattr(tenant, 'keys') else {}
-                
+
                 if 'tenant_id' not in tenant_dict or not tenant_dict['tenant_id']:
                     tenant_dict['tenant_id'] = company_name.lower().replace(' ', '_').replace('-', '_')
-                
+
                 tenant_id = tenant_dict['tenant_id']
-                
+                tenant_payload = {
+                    'tenant_id': tenant_dict.get('tenant_id'),
+                    'tenant_name': tenant_dict.get('tenant_name'),
+                    'tenant_url': tenant_dict.get('tenant_url'),
+                    'tenant_description': tenant_dict.get('tenant_description'),
+                    'target_market': tenant_dict.get('target_market'),
+                    'key_features': tenant_dict.get('key_features'),
+                }
+
                 saved_tenant, created = tenant_crud.get_or_create_tenant(
                     db_session, tenant_id, tenant_dict
                 )
-                
+
+                if monitor_id and user_id and saved_tenant:
+                    monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+                    if monitor:
+                        monitor_crud.attach_tenant(db_session, monitor, saved_tenant)
+
                 logger.info(f"租户信息{'创建' if created else '更新'}: {tenant_dict.get('tenant_name', company_name)}")
         except Exception as e:
             logger.warning(f"保存租户信息失败: {e}")
-        
+
+        if tenant_payload:
+            analysis_context['tenant'] = tenant_payload
+            task_crud.update_task(db, task_id,
+                progress=40,
+                message='Company profile ready',
+                latest_stage='tenant'
+            )
+            await emit({
+                'type': 'stage',
+                'stage': 'tenant',
+                'progress': 40,
+                'data': tenant_payload
+            })
+
         # 第二步：查找竞争对手
         task_crud.update_task(db, task_id,
             progress=50,
@@ -526,28 +767,109 @@ async def run_analysis_with_persistence(
             logger.info(f"使用已存储的竞争对手: {len(limited_competitors)} 个")
         
         # 保存竞争对手到任务（为了兼容性）
+        competitor_stage_payload: Dict[str, Any] = {'competitors': []}
         if limited_competitors:
             competitors_for_save = []
             for comp in limited_competitors:
                 if hasattr(comp, 'model_dump'):
-                    competitors_for_save.append(comp.model_dump())
+                    comp_dict = comp.model_dump()
                 elif isinstance(comp, dict):
-                    competitors_for_save.append(comp)
+                    comp_dict = comp
                 elif hasattr(comp, '__dict__'):
                     comp_dict = {}
-                    for attr in ['id', 'competitor_id', 'display_name', 'primary_url', 'brief_description', 'demographics', 'source', 'confidence']:
+                    for attr in ['id', 'competitor_id', 'display_name', 'primary_url', 'brief_description', 'demographics', 'source', 'confidence', 'url', 'description', 'target_users']:
                         if hasattr(comp, attr):
                             comp_dict[attr] = getattr(comp, attr)
-                    competitors_for_save.append(comp_dict)
                 else:
-                    competitors_for_save.append({
+                    comp_dict = {
                         'id': str(comp),
                         'display_name': str(comp),
                         'primary_url': '',
                         'brief_description': 'Auto converted'
-                    })
-            
+                    }
+
+                competitors_for_save.append(comp_dict)
+
+            domain_keys = []
+            for comp_dict in competitors_for_save:
+                key = comp_dict.get('competitor_id') or comp_dict.get('id') or comp_dict.get('domain') or comp_dict.get('primary_url')
+                if isinstance(key, str) and key not in domain_keys:
+                    domain_keys.append(key)
+
+            id_lookup: Dict[str, str] = {}
+            if domain_keys:
+                try:
+                    from database.models import Competitor
+                    with get_db_session() as db_session:
+                        records = db_session.query(Competitor).filter(Competitor.competitor_id.in_(domain_keys)).all()
+                        id_lookup = {record.competitor_id: record.id for record in records}
+                except Exception as lookup_error:
+                    logger.warning(f'获取竞争对手主键失败: {lookup_error}')
+
+            enriched_competitors = []
+            for comp_dict in competitors_for_save:
+                domain_key = comp_dict.get('competitor_id') or comp_dict.get('id') or comp_dict.get('domain') or comp_dict.get('primary_url')
+                primary_id = id_lookup.get(domain_key) if isinstance(domain_key, str) else None
+
+                competitor_payload = {
+                    'id': primary_id or domain_key or comp_dict.get('display_name'),
+                    'competitor_id': domain_key,
+                    'display_name': comp_dict.get('display_name') or comp_dict.get('name') or comp_dict.get('id'),
+                    'primary_url': comp_dict.get('primary_url') or comp_dict.get('url') or '',
+                    'brief_description': comp_dict.get('brief_description') or comp_dict.get('description') or '',
+                    'source': comp_dict.get('source', 'analysis'),
+                    'confidence': comp_dict.get('confidence', 0.5),
+                    'demographics': comp_dict.get('demographics') or comp_dict.get('target_users') or ''
+                }
+                enriched_competitors.append(competitor_payload)
+
             basic_competitor_crud.save_competitors(db, task_id, competitors_for_save)
+
+            tracked_competitor_ids: List[str] = []
+            if monitor_id and user_id:
+                try:
+                    from database.models import Competitor
+                    from sqlalchemy import or_
+
+                    with get_db_session() as db_session:
+                        monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+                        if monitor:
+                            seen: Set[str] = set()
+                            for comp_payload in enriched_competitors:
+                                candidate = comp_payload.get('id') or comp_payload.get('competitor_id')
+                                if not candidate or candidate in seen:
+                                    continue
+                                competitor_record = db_session.query(Competitor).filter(
+                                    or_(
+                                        Competitor.id == candidate,
+                                        Competitor.competitor_id == candidate
+                                    )
+                                ).first()
+                                if competitor_record:
+                                    monitor_competitor_crud.set_tracking(
+                                        db_session, monitor.id, competitor_record.id, True
+                                    )
+                                    tracked_competitor_ids.append(competitor_record.id)
+                                    seen.add(candidate)
+                except Exception as tracking_error:
+                    logger.warning(f"同步监控的竞争对手失败: {tracking_error}")
+
+            if tracked_competitor_ids:
+                competitor_stage_payload['tracked_competitor_ids'] = tracked_competitor_ids
+
+            competitor_stage_payload['competitors'] = enriched_competitors
+            analysis_context['competitors'] = competitor_stage_payload
+            task_crud.update_task(db, task_id,
+                progress=70,
+                message='Competitor set generated',
+                latest_stage='competitors'
+            )
+            await emit({
+                'type': 'stage',
+                'stage': 'competitors',
+                'progress': 70,
+                'data': competitor_stage_payload
+            })
         
         # 第三步：分析竞争对手变化（使用统一ID管理）
         task_crud.update_task(db, task_id,
@@ -556,6 +878,7 @@ async def run_analysis_with_persistence(
         )
         
         changes_result = []
+        competitor_mapping: Dict[str, str] = {}
         if enable_research and limited_competitors:
             logger.info("=== 开始竞争对手变化分析（使用统一ID管理） ===")
             competitors_to_analyze = limited_competitors[:3]
@@ -700,11 +1023,13 @@ async def run_analysis_with_persistence(
                 
                 # 合并缓存结果和新结果
                 changes_result = list(cached_results.values()) + new_changes
-                
+
                 if cached_results:
                     logger.info(f"使用缓存结果: {len(cached_results)} 个，新检测: {len(new_changes)} 个")
                 else:
                     logger.info("所有变化检测结果都来自新检测")
+
+            collected_change_records = []
             
             # 保存变化记录到数据库
             for i, changes in enumerate(changes_result):
@@ -735,12 +1060,69 @@ async def run_analysis_with_persistence(
                                     changes_list.append(change)
                         
                         if changes_list:
-                            change_crud.save_changes(db, comp_id, comp_url, changes_list)
+                            saved_records = change_crud.save_changes(db, comp_id, comp_url, changes_list)
+                            if saved_records:
+                                collected_change_records.extend(saved_records)
                             logger.info(f"保存变化记录: {len(changes_list)} 条记录, competitor_id={comp_id}")
                 
                 except Exception as e:
                     logger.error(f"保存变化记录失败: {e}")
         
+        change_stage_payload: Dict[str, Any] = {'changes': []}
+        candidate_competitor_ids = set(competitor_mapping.values())
+        if not candidate_competitor_ids and collected_change_records:
+            candidate_competitor_ids = {record.competitor_id for record in collected_change_records if hasattr(record, 'competitor_id')}
+
+        if candidate_competitor_ids:
+            try:
+                from database.models import ChangeDetection
+                with get_db_session() as db_session:
+                    change_records = (
+                        db_session.query(ChangeDetection)
+                        .filter(ChangeDetection.competitor_id.in_(list(candidate_competitor_ids)))
+                        .order_by(ChangeDetection.detected_at.desc())
+                        .limit(120)
+                        .all()
+                    )
+                    read_map = {}
+                    if user_id:
+                        read_map = change_read_crud.fetch_read_ids(
+                            db_session,
+                            user_id,
+                            [record.id for record in change_records]
+                        )
+                    for record in change_records:
+                        read_at_value = None
+                        if record.id in read_map and read_map[record.id]:
+                            read_at_value = read_map[record.id].isoformat()
+                        change_stage_payload['changes'].append({
+                            'id': record.id,
+                            'url': record.url,
+                            'change_type': record.change_type,
+                            'content': record.content,
+                            'timestamp': record.detected_at.isoformat() if record.detected_at else None,
+                            'threat_level': record.threat_level,
+                            'why_matter': record.why_matter,
+                            'suggestions': record.suggestions,
+                            'read_at': read_at_value
+                        })
+            except Exception as fetch_error:
+                logger.warning(f"获取变化记录失败: {fetch_error}")
+
+        if change_stage_payload['changes']:
+            analysis_context['changes'] = change_stage_payload
+            task_crud.update_task(db, task_id,
+                progress=90,
+                message='Change insights compiled',
+                latest_stage='changes'
+            )
+            await emit({
+                'type': 'stage',
+                'stage': 'changes',
+                'progress': 90,
+                'data': change_stage_payload
+            })
+
         # 第四步：生成最终结果
         task_crud.update_task(db, task_id,
             progress=95,
@@ -794,24 +1176,47 @@ async def run_analysis_with_persistence(
                 datetime.utcnow() - task.started_at
             ).total_seconds()
         
+        if monitor_id and user_id:
+            try:
+                with get_db_session() as db_session:
+                    monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+                    if monitor:
+                        monitor_crud.set_latest_task(db_session, monitor, task_id)
+            except Exception as monitor_error:
+                logger.warning(f"更新监控任务失败: {monitor_error}")
+
         # 更新任务状态：完成
         task_crud.update_task(db, task_id,
             status="completed",
             progress=100,
             message="Analysis complete",
-            results=final_results
+            results=final_results,
+            latest_stage="complete"
         )
-        
+
+        await emit({
+            'type': 'status',
+            'stage': 'complete',
+            'progress': 100,
+            'data': analysis_context
+        })
+
         logger.info(f"分析完成: {company_name}, 找到 {len(limited_competitors)} 个竞争对手, 缓存命中 {len(cached_results) if enable_caching else 0} 个")
-        
+
     except Exception as e:
         logger.error(f"分析失败 [{company_name}]: {str(e)}", exc_info=True)
-        
+
         task_crud.update_task(db, task_id,
             status="failed",
             progress=0,
             message=f"Analysis failed: {str(e)}"
         )
+        await emit({
+            'type': 'status',
+            'stage': 'failed',
+            'progress': 0,
+            'message': str(e)
+        })
 
 # 保持原有的run_analysis函数作为向后兼容
 async def run_analysis(task_id: str, company_name: str, enable_research: bool, max_competitors: int, db: Session):
@@ -1120,21 +1525,303 @@ async def logout():
     """登出（前端需要删除token）"""
     return {"message": "Logged out successfully"}
 
-def require_auth(current_user = Depends(verify_token)):
-    """要求认证的依赖项"""
-    return current_user
+@app.websocket("/ws/analysis/{task_id}")
+async def analysis_stream(websocket: WebSocket, task_id: str):
+    token = websocket.query_params.get('token')
+    if not token:
+        auth_header = websocket.headers.get('authorization')
+        if auth_header and auth_header.lower().startswith('bearer '):
+            token = auth_header.split(' ', 1)[1]
 
-# ========== 现有的分析相关路由（完全保留）==========
+    if not token:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    queue = await event_broker.subscribe(task_id)
+    try:
+        while True:
+            event = await queue.get()
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await event_broker.unsubscribe(task_id, queue)
+
+
+@app.get("/api/monitors")
+async def list_monitors(current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db_session() as db_session:
+        monitors = monitor_crud.list_monitors(db_session, user_id)
+        payload = [serialize_monitor(monitor) for monitor in monitors]
+    return {'monitors': payload}
+
+
+@app.post("/api/monitors")
+async def create_monitor(request: MonitorCreateRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not request.url.strip():
+        raise HTTPException(status_code=400, detail="Monitor URL is required")
+
+    with get_db_session() as db_session:
+        monitor = monitor_crud.get_or_create_monitor(
+            db_session,
+            user_id=user_id,
+            url=request.url.strip(),
+            name=request.name or request.url.strip()
+        )
+        payload = serialize_monitor(monitor)
+    return payload
+
+
+@app.patch("/api/monitors/{monitor_id}")
+async def rename_monitor(monitor_id: str, request: MonitorRenameRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not request.name.strip():
+        raise HTTPException(status_code=400, detail="Monitor name cannot be empty")
+
+    with get_db_session() as db_session:
+        monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+        if not monitor:
+            raise HTTPException(status_code=404, detail="Monitor not found")
+        monitor = monitor_crud.update_monitor_name(db_session, monitor, request.name.strip())
+        payload = serialize_monitor(monitor)
+    return payload
+
+
+
+@app.delete("/api/monitors/{monitor_id}")
+async def delete_monitor(monitor_id: str, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db_session() as db_session:
+        monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+        if not monitor:
+            raise HTTPException(status_code=404, detail="Monitor not found")
+        monitor_crud.deactivate_monitor(db_session, monitor)
+    return {'status': 'ok'}
+
+
+def _serialize_competitor_record(record) -> Dict[str, Any]:
+    return {
+        'id': getattr(record, 'id', None),
+        'competitor_id': getattr(record, 'competitor_id', None),
+        'display_name': getattr(record, 'display_name', None),
+        'primary_url': getattr(record, 'primary_url', None),
+        'brief_description': getattr(record, 'brief_description', None),
+        'source': getattr(record, 'source', None),
+        'demographics': getattr(record, 'demographics', None),
+    }
+
+
+@app.post("/api/competitors/{competitor_id}/track")
+async def track_competitor(competitor_id: str, request: CompetitorTrackRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not request.monitor_id:
+        raise HTTPException(status_code=400, detail="monitor_id is required")
+
+    with get_db_session() as db_session:
+        monitor = monitor_crud.get_monitor(db_session, request.monitor_id, user_id)
+        if not monitor:
+            raise HTTPException(status_code=404, detail="Monitor not found")
+
+        from database.models import Competitor
+        from sqlalchemy import or_
+
+        competitor = db_session.query(Competitor).filter(
+            or_(
+                Competitor.id == competitor_id,
+                Competitor.competitor_id == competitor_id
+            )
+        ).first()
+
+        if not competitor:
+            normalized_url = (request.url or '').strip()
+            if not normalized_url:
+                raise HTTPException(status_code=404, detail="Competitor not found")
+
+            # Ensure URL has protocol for storage consistency
+            if not normalized_url.startswith(('http://', 'https://')):
+                normalized_url = f'https://{normalized_url}'
+
+            competitor_payload = {
+                'competitor_id': competitor_id,
+                'display_name': request.display_name or competitor_id,
+                'primary_url': normalized_url,
+                'brief_description': request.description or '',
+                'source': request.source or 'manual',
+                'extra_data': {'created_from_monitor': monitor.id},
+            }
+            if request.confidence is not None:
+                competitor_payload['confidence'] = max(0.0, min(1.0, request.confidence))
+
+            competitor, _ = competitor_crud.get_or_create_competitor(
+                db_session,
+                competitor_id=competitor_id,
+                competitor_data=competitor_payload
+            )
+
+        monitor_competitor_crud.set_tracking(db_session, monitor.id, competitor.id, True)
+        tracked_ids = monitor_competitor_crud.get_tracked_competitor_ids(db_session, monitor.id)
+
+    return {
+        'status': 'ok',
+        'tracked_competitor_ids': tracked_ids,
+        'competitor': _serialize_competitor_record(competitor)
+    }
+
+
+@app.delete("/api/competitors/{competitor_id}/untrack")
+async def untrack_competitor(competitor_id: str, request: CompetitorTrackRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not request.monitor_id:
+        raise HTTPException(status_code=400, detail="monitor_id is required")
+
+    with get_db_session() as db_session:
+        monitor = monitor_crud.get_monitor(db_session, request.monitor_id, user_id)
+        if not monitor:
+            raise HTTPException(status_code=404, detail="Monitor not found")
+
+        from database.models import Competitor
+        from sqlalchemy import or_
+
+        competitor = db_session.query(Competitor).filter(
+            or_(
+                Competitor.id == competitor_id,
+                Competitor.competitor_id == competitor_id
+            )
+        ).first()
+        if not competitor:
+            raise HTTPException(status_code=404, detail="Competitor not found")
+
+        monitor_competitor_crud.remove_tracking(db_session, monitor.id, competitor.id)
+        tracked_ids = monitor_competitor_crud.get_tracked_competitor_ids(db_session, monitor.id)
+
+    return {
+        'status': 'ok',
+        'tracked_competitor_ids': tracked_ids,
+        'untracked_competitor_id': competitor.id
+    }
+
+
+@app.post("/api/changes/{change_id}/read")
+async def mark_change_read(change_id: str, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db_session() as db_session:
+        receipt = change_read_crud.mark_read(db_session, user_id, change_id)
+    return {'change_id': change_id, 'read_at': receipt.read_at} if receipt else {'change_id': change_id}
+
+
+@app.post("/api/changes/bulk-read")
+async def bulk_read_changes(request: BulkReadRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not request.change_ids:
+        return {'updated': 0}
+
+    with get_db_session() as db_session:
+        updated = change_read_crud.bulk_mark_read(db_session, user_id, request.change_ids)
+    return {'updated': updated}
+
+
+@app.get("/api/archives")
+async def list_archives(current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db_session() as db_session:
+        archives = archive_crud.list_archives(db_session, user_id)
+        payload = [serialize_archive(archive) for archive in archives]
+    return {'archives': payload}
+
+
+@app.post("/api/archives")
+async def create_archive(request: ArchiveCreateRequest, current_user = Depends(require_auth)):
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not request.title.strip():
+        raise HTTPException(status_code=400, detail="Archive title is required")
+
+    tenant_snapshot = None
+    competitor_snapshot = None
+    change_snapshot = None
+
+    with get_db_session() as db_session:
+        if request.task_id:
+            task = task_crud.get_task(db_session, request.task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            results = task.results or {}
+            tenant_snapshot = results.get('tenant')
+            competitor_snapshot = results.get('competitors')
+            change_snapshot = []
+            competitor_analysis = results.get('competitor_analysis') or {}
+            for content in competitor_analysis.values():
+                if isinstance(content, dict):
+                    changes = content.get('changes')
+                    if isinstance(changes, dict) and 'changes' in changes:
+                        change_snapshot.extend(changes.get('changes') or [])
+                    elif isinstance(changes, list):
+                        change_snapshot.extend(changes)
+            if not change_snapshot:
+                change_snapshot = results.get('changes')
+
+        archive = archive_crud.create_archive(
+            db_session,
+            user_id=user_id,
+            monitor_id=request.monitor_id,
+            task_id=request.task_id,
+            title=request.title.strip(),
+            tenant_snapshot=tenant_snapshot,
+            competitor_snapshot=competitor_snapshot,
+            change_snapshot=change_snapshot,
+            metadata=request.metadata or {},
+            search_text=(request.metadata or {}).get('search_text') if request.metadata else None
+        )
+
+        payload = serialize_archive(archive)
+
+    return payload
 
 @app.post("/api/analyze", response_model=TaskResponse)
 async def start_analysis(
-    request: AnalysisRequest, 
+    request: AnalysisRequest,
     background_tasks: BackgroundTasks,
-    # current_user = Depends(require_auth),  # 取消注释以要求认证
+    current_user = Depends(require_auth),
     db: Session = Depends(get_db)
 ):
     """启动分析任务"""
-    if not request.company_name.strip():
+    company_name = (request.company_name or '').strip()
+    if not company_name:
         raise HTTPException(status_code=400, detail="Company name cannot be empty")
     
     if request.max_competitors < 1 or request.max_competitors > 20:
@@ -1143,24 +1830,63 @@ async def start_analysis(
     if not validate_config():
         raise HTTPException(status_code=500, detail="Service configuration incomplete")
     
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail='Authentication required')
+
+    monitor_id = request.monitor_id
+
+    if monitor_id:
+        try:
+            with get_db_session() as db_session:
+                monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
+                if not monitor:
+                    raise HTTPException(status_code=404, detail='Monitor not found')
+        except HTTPException:
+            raise
+        except Exception as monitor_error:
+            logger.error(f'Failed to validate monitor {monitor_id}: {monitor_error}')
+            raise HTTPException(status_code=500, detail='Monitor validation failed')
+    else:
+        base_url = (request.tenant_url or company_name).strip()
+        try:
+            with get_db_session() as db_session:
+                monitor = monitor_crud.get_or_create_monitor(
+                    db_session,
+                    user_id=user_id,
+                    url=base_url or company_name,
+                    name=request.monitor_name or company_name
+                )
+                if monitor:
+                    monitor_id = monitor.id
+        except Exception as monitor_error:
+            logger.warning(f'自动创建监控失败: {monitor_error}')
+            monitor_id = None
+
     task = task_crud.create_task(
         db,
-        company_name=request.company_name.strip(),
+        company_name=company_name,
         config={
             "enable_research": request.enable_research,
             "max_competitors": request.max_competitors,
             "enable_caching": request.enable_caching
-        }
+        },
+        user_id=user_id,
+        monitor_id=monitor_id
     )
-    
+
+    event_broker.prime(task.id, [])
+
     background_tasks.add_task(
         run_analysis_with_persistence,
         task.id,
-        request.company_name.strip(),
+        company_name,
         request.enable_research,
         request.max_competitors,
         request.enable_caching,
-        db
+        db,
+        user_id,
+        monitor_id
     )
     
     logger.info(f"新分析任务已启动: {request.company_name} (ID: {task.id}, 缓存: {'启用' if request.enable_caching else '禁用'})")
@@ -1168,7 +1894,8 @@ async def start_analysis(
     cache_message = f", caching {'enabled' if request.enable_caching else 'disabled'}"
     return TaskResponse(
         task_id=task.id,
-        message=f"Analysis started with unified ID management{cache_message}"
+        message=f"Analysis started with unified ID management{cache_message}",
+        monitor_id=monitor_id
     )
 
 @app.get("/api/status/{task_id}", response_model=StatusResponse)

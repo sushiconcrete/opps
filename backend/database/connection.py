@@ -118,7 +118,9 @@ def init_db():
             required_tables = [
                 'analysis_tasks', 'tenants', 'competitors', 
                 'tenant_competitors', 'change_detection_cache', 
-                'content_storage', 'competitor_records', 'change_detections'
+                'content_storage', 'competitor_records', 'change_detections',
+                'monitors', 'monitor_competitors', 'change_read_receipts',
+                'analysis_archives', 'users'
             ]
             
             missing_tables = []

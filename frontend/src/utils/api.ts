@@ -1,602 +1,676 @@
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '')
+
 export type Stage = 'tenant' | 'competitors' | 'changes'
 
-export interface StageEvent<T = unknown> {
+export type AnalysisStageEvent<T = unknown> = {
+  type: 'stage'
   stage: Stage
   data: T
+  progress?: number
 }
 
-interface TenantRecord {
-  tenant_id?: string
-  tenant_url?: string
-  tenant_name?: string
-  tenant_description?: string
-  target_market?: string
-  key_features?: string[]
+export type AnalysisStatusEvent = {
+  type: 'status'
+  stage: string
+  progress?: number
+  message?: string
+  data?: unknown
 }
 
-interface TenantSummary {
-  tenant_id: string
-  tenant_url: string
-  tenant_name: string
-  tenant_description: string
-  target_market: string
-  key_features: string[]
+export type AnalysisStreamEvent = AnalysisStageEvent | AnalysisStatusEvent
+
+export interface StartAnalysisOptions {
+  monitorId?: string
+  monitorName?: string
+  tenantUrl?: string
+  enableResearch?: boolean
+  maxCompetitors?: number
+  enableCaching?: boolean
 }
 
-interface CompetitorRecord {
-  id?: string
-  display_name?: string
-  primary_url?: string
-  brief_description?: string
-  source?: string
-  confidence?: number
-  demographics?: string
-  target_users?: string
-  name?: string
-  url?: string
-  description?: string
+export interface StartAnalysisResponse {
+  taskId: string
+  monitorId?: string
 }
 
-interface CompetitorSummary {
+export interface MonitorSummary {
   id: string
-  display_name: string
-  primary_url: string
-  brief_description: string
+  name: string
+  url: string
+  createdAt: string
+  updatedAt?: string | null
+  lastRunAt?: string | null
+  latestTaskId?: string | null
+  latestTaskStatus?: string | null
+  latestTaskProgress?: number | null
+  archivedAt?: string | null
+  trackedCompetitorIds: string[]
+  trackedCompetitorSlugs: string[]
+}
+
+export interface ArchiveEntry {
+  id: string
+  title: string
+  monitorId: string | null
+  taskId: string | null
+  createdAt: string
+  tenant: unknown
+  competitors: unknown
+  changes: unknown
+  metadata: Record<string, unknown> | null
+}
+
+export interface ArchiveCreateRequest {
+  monitorId?: string
+  taskId?: string
+  title: string
+  metadata?: Record<string, unknown>
+}
+
+export interface TaskResults {
+  task_id: string
+  status: string
+  results: Record<string, unknown>
+  started_at: string
+  completed_at: string
+}
+
+export interface TenantSnapshot {
+  id: string
+  name: string
+  url: string
+  description: string
+  targetMarket: string
+  keyFeatures: string[]
+}
+
+export interface CompetitorInsight {
+  id: string
+  competitorId: string | null
+  displayName: string
+  primaryUrl: string
+  briefDescription: string
   source: string
   confidence: number
   demographics: string
 }
 
-interface CompetitorsSummaryPayload {
-  competitors: CompetitorSummary[]
+export interface CompetitorStageSnapshot {
+  competitors: CompetitorInsight[]
+  trackedCompetitorIds: string[]
 }
 
-interface ChangeDetail {
-  id?: string
+export interface ChangeInsight {
+  id: string
   url: string
-  change_type: string
+  changeType: string
   content: string
   timestamp: string
-  threat_level: number
-  why_matter: string
+  threatLevel: number
+  whyMatter: string
   suggestions: string
-  read_at?: string | null
+  readAt: string | null
 }
 
-interface ChangesSummaryPayload {
-  changes: ChangeDetail[]
+export interface TrackCompetitorOptions {
+  monitorId: string
+  displayName?: string
+  url?: string
+  source?: string
+  description?: string
+  confidence?: number
 }
 
-interface BackendChangeEntry {
-  id?: string
-  change_type?: string
-  content?: string
-  timestamp?: string
-  threat_level?: number
-  why_matter?: string
-  suggestions?: string
-  read_at?: string | null
+export interface TrackedCompetitor {
+  id: string
+  competitorId: string | null
+  displayName: string
+  primaryUrl: string
+  briefDescription: string
+  source: string
+  demographics: string
+  confidence?: number
 }
 
-interface CompetitorChangeEnvelope {
-  changes?: BackendChangeEntry[]
+export interface TrackCompetitorResponse {
+  trackedCompetitorIds: string[]
+  competitor?: TrackedCompetitor
 }
 
-interface CompetitorAnalysisEntry {
-  competitor?: CompetitorRecord
-  changes?: CompetitorChangeEnvelope
+export interface UntrackCompetitorResponse {
+  trackedCompetitorIds: string[]
+  untrackedCompetitorId?: string
 }
 
-type CompetitorAnalysisMap = Record<string, CompetitorAnalysisEntry>
-
-
-// 你现有的API请求类型
-interface AnalysisRequest {
-  company_name: string
-  enable_research: boolean
-  max_competitors: number
-  enable_caching: boolean
-}
-
-interface TaskResponse {
-  task_id: string
-  message: string
-}
-
-interface StatusResponse {
-  task_id: string
-  status: string
-  progress: number
-  message: string
-  company_name: string
-}
-
-interface TaskResults {
-  task_id: string
-  status: string
-  results: {
-    tenant?: TenantRecord | null
-    competitors?: CompetitorRecord[] | null
-    competitor_analysis?: CompetitorAnalysisMap | null
-    summary?: unknown
+export function adaptTenantStage(data: unknown): TenantSnapshot | null {
+  if (!data || typeof data !== 'object') {
+    return null
   }
-  started_at: string
-  completed_at: string
-}
+  const record = data as Record<string, unknown>
 
-// 数据格式转换函数
-function transformTenantData(tenant: TenantRecord | null | undefined): TenantSummary {
-  const rawFeatures = tenant?.key_features
-  const keyFeatures = Array.isArray(rawFeatures) ? rawFeatures : []
+  const name = coalesceString(record.tenant_name, 'Unknown company')
+  const url = coalesceUrl(record.tenant_url)
+  const description = coalesceString(record.tenant_description, `${name} overview pending.`)
+  const targetMarket = coalesceString(record.target_market, 'Market pending')
+  const keyFeaturesRaw = Array.isArray(record.key_features) ? record.key_features : []
+  const keyFeatures = keyFeaturesRaw
+    .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+    .map((value) => value.trim())
 
   return {
-    tenant_id: tenant?.tenant_id ?? 'unknown',
-    tenant_url: tenant?.tenant_url ?? 'unknown',
-    tenant_name: tenant?.tenant_name ?? 'Unknown Company',
-    tenant_description: tenant?.tenant_description ?? 'Unknown description',
-    target_market: tenant?.target_market ?? 'Unknown market',
-    key_features: keyFeatures,
+    id: coalesceString(record.tenant_id, 'unknown'),
+    name,
+    url,
+    description,
+    targetMarket,
+    keyFeatures,
   }
 }
 
-function transformCompetitorsData(competitors: CompetitorRecord[] | null | undefined): CompetitorsSummaryPayload {
-  const list = competitors ?? []
-  return {
-    competitors: list.map((comp, index) => ({
-      id: comp.id ?? `comp_${index}`,
-      display_name: comp.display_name ?? comp.name ?? 'Unknown Competitor',
-      primary_url: comp.primary_url ?? comp.url ?? '',
-      brief_description: comp.brief_description ?? comp.description ?? 'No description available',
-      source: comp.source ?? 'search',
-      confidence: typeof comp.confidence === 'number' ? comp.confidence : 0.5,
-      demographics: comp.demographics ?? comp.target_users ?? 'Unknown demographics',
-    })),
+export function adaptCompetitorStage(data: unknown): CompetitorStageSnapshot {
+  if (!data || typeof data !== 'object') {
+    return { competitors: [], trackedCompetitorIds: [] }
   }
-}
 
-function transformChangesData(
-  competitorAnalysis: CompetitorAnalysisMap | null | undefined,
-  competitors: CompetitorRecord[] | null | undefined
-): ChangesSummaryPayload {
-  const analysisEntries: CompetitorAnalysisEntry[] = Object.values(competitorAnalysis ?? {})
-  const firstWithChanges = analysisEntries.find((analysis) => {
-    const changeList = analysis?.changes?.changes
-    return Array.isArray(changeList) && changeList.length > 0
-  })
+  const payload = data as Record<string, unknown>
+  const rawCompetitors = Array.isArray(payload.competitors) ? payload.competitors : []
+  const trackedIds = Array.isArray(payload.tracked_competitor_ids)
+    ? (payload.tracked_competitor_ids as unknown[]).map((value) => String(value))
+    : []
 
-  if (firstWithChanges?.competitor) {
-    const fallbackUrl = firstWithChanges.competitor.primary_url ?? 'Unknown URL'
-    const rawChanges = firstWithChanges.changes?.changes ?? []
-    const normalized: ChangeDetail[] = rawChanges.map((change, index) => {
-      const threatLevel = typeof change?.threat_level === 'number' ? change.threat_level : 5
+  const competitors = rawCompetitors
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .slice(0, 10)
+    .map((competitor, index) => {
+      const displayName = coalesceString(
+        competitor.display_name ?? competitor.name,
+        `Competitor ${index + 1}`
+      )
+      const primaryUrl = coalesceUrl(competitor.primary_url ?? competitor.url)
+      const briefDescription = coalesceString(
+        competitor.brief_description ?? competitor.description,
+        'No briefing yet.'
+      )
+      const source = coalesceString(competitor.source, 'analysis')
+      const confidenceValue = typeof competitor.confidence === 'number'
+        ? competitor.confidence
+        : parseFloat(String(competitor.confidence ?? 0.5))
+      const confidence = Number.isFinite(confidenceValue) ? clamp(confidenceValue, 0, 1) : 0.5
+      const demographics = coalesceString(
+        competitor.demographics ?? competitor.target_users,
+        'Undisclosed audience'
+      )
+
+      const id = coalesceString(
+        competitor.id ?? competitor.competitor_id ?? competitor.domain ?? primaryUrl,
+        `${displayName}-${index}`
+      )
+      const competitorId = typeof competitor.competitor_id === 'string'
+        ? competitor.competitor_id
+        : typeof competitor.id === 'string'
+          ? competitor.id
+          : null
 
       return {
-        id: change?.id ?? `${fallbackUrl}-change-${index}`,
-        url: fallbackUrl,
-        change_type: change?.change_type ?? 'Modified',
-        content: change?.content ?? 'No content available',
-        timestamp: change?.timestamp ?? new Date().toISOString(),
-        threat_level: threatLevel,
-        why_matter: change?.why_matter ?? 'Impact assessment pending',
-        suggestions: change?.suggestions ?? 'No suggestions available',
-        read_at: change?.read_at ?? null,
+        id,
+        competitorId,
+        displayName,
+        primaryUrl,
+        briefDescription,
+        source,
+        confidence,
+        demographics,
       }
     })
 
-    return { changes: normalized }
-  }
-
-  const firstComp = (competitors ?? [])[0]
-  const fallbackUrl = firstComp?.primary_url ?? 'Unknown URL'
   return {
-    changes: [
-      {
-        id: `${fallbackUrl}-baseline`,
-        url: fallbackUrl,
-        change_type: 'Analysis',
-        content: 'Competitor analysis completed',
-        timestamp: new Date().toISOString(),
-        threat_level: 3,
-        why_matter: 'Baseline competitor intelligence gathered',
-        suggestions: 'Continue monitoring for future changes',
-        read_at: null,
-      },
-    ],
+    competitors,
+    trackedCompetitorIds: trackedIds,
   }
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+export function adaptChangeStage(data: unknown): ChangeInsight[] {
+  if (!data || typeof data !== 'object') {
+    return []
+  }
 
-function extractCompanyName(targetUrl: string): string {
-  let companyName = 'example-company'
+  const payload = data as Record<string, unknown>
+  const list = Array.isArray(payload.changes) ? payload.changes : []
 
-  const urlParts = targetUrl.split('?')
-  if (urlParts.length > 1) {
-    const params = new URLSearchParams(urlParts[1])
-    const company = params.get('company')
-    if (company) {
-      companyName = decodeURIComponent(company)
+  return list
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((entry, index) => {
+      const timestamp = coalesceString(entry.timestamp, new Date().toISOString())
+      const threatLevel = typeof entry.threat_level === 'number'
+        ? entry.threat_level
+        : parseFloat(String(entry.threat_level ?? 5))
+
+      return {
+        id: coalesceString(entry.id, `change-${index}`),
+        url: coalesceUrl(entry.url),
+        changeType: coalesceString(entry.change_type, 'Modified'),
+        content: coalesceString(entry.content, 'Details pending'),
+        timestamp,
+        threatLevel: Number.isFinite(threatLevel) ? threatLevel : 5,
+        whyMatter: coalesceString(entry.why_matter, 'Impact assessment pending'),
+        suggestions: coalesceString(entry.suggestions, 'Review with GTM team'),
+        readAt:
+          typeof entry.read_at === 'string' && entry.read_at.trim() ? entry.read_at : null,
+      }
+    })
+}
+
+function getAuthHeaders(): HeadersInit {
+  if (typeof window === 'undefined') {
+    return {}
+  }
+  const token = window.localStorage.getItem('auth_token')
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+async function handleResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    let detail: string | undefined
+    try {
+      const payload = await response.json()
+      detail = payload?.detail ?? payload?.message
+    } catch {
+      detail = response.statusText
+    }
+    throw new Error(detail || `Request failed with status ${response.status}`)
+  }
+  if (response.status === 204) {
+    // @ts-expect-error allow void return
+    return undefined
+  }
+  return (await response.json()) as T
+}
+
+export async function startAnalysis(companyName: string, options: StartAnalysisOptions = {}): Promise<StartAnalysisResponse> {
+  const payload = {
+    company_name: companyName,
+    enable_research: options.enableResearch ?? true,
+    max_competitors: options.maxCompetitors ?? 10,
+    enable_caching: options.enableCaching ?? true,
+    monitor_id: options.monitorId,
+    monitor_name: options.monitorName,
+    tenant_url: options.tenantUrl,
+  }
+
+  const response = await fetch(`${API_BASE}/api/analyze`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const data = await handleResponse<{ task_id: string; monitor_id?: string }>(response)
+  return {
+    taskId: data.task_id,
+    monitorId: data.monitor_id,
+  }
+}
+
+export async function fetchMonitors(): Promise<MonitorSummary[]> {
+  const response = await fetch(`${API_BASE}/api/monitors`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+
+  const data = await handleResponse<{ monitors: Array<Record<string, unknown>> }>(response)
+  return data.monitors.map(mapMonitor)
+}
+
+export async function createMonitor(payload: { url: string; name?: string }): Promise<MonitorSummary> {
+  const response = await fetch(`${API_BASE}/api/monitors`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const data = await handleResponse<Record<string, unknown>>(response)
+  return mapMonitor(data)
+}
+
+export async function updateMonitorName(monitorId: string, name: string): Promise<MonitorSummary> {
+  const response = await fetch(`${API_BASE}/api/monitors/${monitorId}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({ name }),
+  })
+
+  const data = await handleResponse<Record<string, unknown>>(response)
+  return mapMonitor(data)
+}
+
+export async function deleteMonitor(monitorId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/monitors/${monitorId}`, {
+    method: 'DELETE',
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+  await handleResponse(response)
+}
+
+export async function trackCompetitor(
+  competitorId: string,
+  options: TrackCompetitorOptions,
+): Promise<TrackCompetitorResponse> {
+  const response = await fetch(`${API_BASE}/api/competitors/${encodeURIComponent(competitorId)}/track`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({
+      monitor_id: options.monitorId,
+      display_name: options.displayName,
+      url: options.url,
+      source: options.source,
+      description: options.description,
+      confidence: options.confidence,
+    }),
+  })
+
+  const data = await handleResponse<{
+    tracked_competitor_ids?: unknown[]
+    competitor?: Record<string, unknown>
+  }>(response)
+
+  return {
+    trackedCompetitorIds: Array.isArray(data.tracked_competitor_ids)
+      ? data.tracked_competitor_ids.map((value) => String(value))
+      : [],
+    competitor: data.competitor ? mapTrackedCompetitor(data.competitor) : undefined,
+  }
+}
+
+export async function untrackCompetitor(
+  competitorId: string,
+  options: TrackCompetitorOptions,
+): Promise<UntrackCompetitorResponse> {
+  const response = await fetch(`${API_BASE}/api/competitors/${encodeURIComponent(competitorId)}/untrack`, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({ monitor_id: options.monitorId }),
+  })
+
+  const data = await handleResponse<{
+    tracked_competitor_ids?: unknown[]
+    untracked_competitor_id?: unknown
+  }>(response)
+
+  return {
+    trackedCompetitorIds: Array.isArray(data.tracked_competitor_ids)
+      ? data.tracked_competitor_ids.map((value) => String(value))
+      : [],
+    untrackedCompetitorId: data.untracked_competitor_id ? String(data.untracked_competitor_id) : undefined,
+  }
+}
+
+export async function markChangeRead(changeId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/changes/${encodeURIComponent(changeId)}/read`, {
+    method: 'POST',
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+  await handleResponse(response)
+}
+
+export async function bulkMarkChangesRead(changeIds: string[]): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/changes/bulk-read`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({ change_ids: changeIds }),
+  })
+  await handleResponse(response)
+}
+
+export async function fetchArchives(): Promise<ArchiveEntry[]> {
+  const response = await fetch(`${API_BASE}/api/archives`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+
+  const data = await handleResponse<{ archives: Array<Record<string, unknown>> }>(response)
+  return data.archives.map(mapArchive)
+}
+
+export async function createArchive(request: ArchiveCreateRequest): Promise<ArchiveEntry> {
+  const response = await fetch(`${API_BASE}/api/archives`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
+    body: JSON.stringify({
+      monitor_id: request.monitorId,
+      task_id: request.taskId,
+      title: request.title,
+      metadata: request.metadata ?? {},
+    }),
+  })
+
+  const data = await handleResponse<Record<string, unknown>>(response)
+  return mapArchive(data)
+}
+
+export async function fetchTaskResults(taskId: string): Promise<TaskResults> {
+  const response = await fetch(`${API_BASE}/api/results/${encodeURIComponent(taskId)}`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+
+  return handleResponse<TaskResults>(response)
+}
+
+export async function* streamAnalysisEvents(taskId: string): AsyncGenerator<AnalysisStreamEvent> {
+  const token = typeof window !== 'undefined' ? window.localStorage.getItem('auth_token') : null
+  const wsUrl = buildWebSocketUrl(`/ws/analysis/${encodeURIComponent(taskId)}`, token ?? undefined)
+
+  const socket = new WebSocket(wsUrl)
+
+  await new Promise<void>((resolve, reject) => {
+    const handleError = () => {
+      cleanup()
+      reject(new Error('Unable to establish analysis stream'))
+    }
+    const handleOpen = () => {
+      cleanup()
+      resolve()
+    }
+    const cleanup = () => {
+      socket.removeEventListener('open', handleOpen)
+      socket.removeEventListener('error', handleError)
+    }
+    socket.addEventListener('open', handleOpen)
+    socket.addEventListener('error', handleError)
+  })
+
+  const queue: AnalysisStreamEvent[] = []
+  let notify: (() => void) | null = null
+  let closed = false
+
+  socket.addEventListener('message', (event) => {
+    try {
+      const raw = JSON.parse(event.data)
+      const normalized = normalizeEvent(raw)
+      if (normalized) {
+        queue.push(normalized)
+        if (notify) {
+          notify()
+          notify = null
+        }
+      }
+    } catch {
+      // ignore malformed message
+    }
+  })
+
+  const finalize = () => {
+    closed = true
+    if (notify) {
+      notify()
+      notify = null
     }
   }
 
-  return companyName
-    .replace(/^https?:\/\//, '')
-    .replace(/^www\./, '')
-    .replace(/\/$/, '')
-    .split('/')[0]
-}
-
-// 主要的流式API函数 - 默认使用前端内置Mock，必要时可切换回后端
-export async function* streamMockRun(url: string): AsyncGenerator<StageEvent, void, unknown> {
-  const companyName = extractCompanyName(url)
-  const shouldUseBackend = (import.meta.env.VITE_USE_BACKEND ?? '').toLowerCase() === 'true'
-
-  if (shouldUseBackend) {
-    yield* streamBackendRun(url, companyName)
-    return
-  }
-
-  yield* streamDesignMock(companyName)
-}
-
-async function* streamBackendRun(_originalUrl: string, companyName: string): AsyncGenerator<StageEvent, void, unknown> {
-  const base = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+  socket.addEventListener('close', finalize)
+  socket.addEventListener('error', finalize)
 
   try {
-    // 第1步：开始分析
-    const analysisRequest: AnalysisRequest = {
-      company_name: companyName,
-      enable_research: true,
-      max_competitors: 10,
-      enable_caching: true
+    while (!closed || queue.length > 0) {
+      if (!queue.length) {
+        await new Promise<void>((resolve) => {
+          notify = resolve
+        })
+        continue
+      }
+      const event = queue.shift()
+      if (event) {
+        yield event
+      }
     }
-
-    const startResponse = await fetch(`${base}/api/analyze`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(analysisRequest)
-    })
-
-    if (!startResponse.ok) {
-      throw new Error(`Failed to start analysis: ${startResponse.statusText}`)
-    }
-
-    const taskData: TaskResponse = await startResponse.json()
-    const taskId = taskData.task_id
-
-    // 第2步：轮询状态并模拟流式响应
-    let tenantSent = false
-    let competitorsSent = false
-    let changesSent = false
-
-    while (true) {
-      // 获取当前状态
-      const statusResponse = await fetch(`${base}/api/status/${taskId}`)
-      if (!statusResponse.ok) {
-        throw new Error(`Failed to get status: ${statusResponse.statusText}`)
-      }
-
-      const status: StatusResponse = await statusResponse.json()
-      
-      // 根据进度发送不同阶段的数据
-      if (!tenantSent && status.progress >= 25) {
-        // 发送租户信息（模拟数据，因为状态API可能不包含具体数据）
-        yield {
-          stage: 'tenant',
-          data: {
-            tenant_id: companyName.toLowerCase().replace(/[^a-z0-9]/g, '_'),
-            tenant_url: `https://${companyName.replace(/[^a-zA-Z0-9]/g, '')}.com`,
-            tenant_name: companyName.charAt(0).toUpperCase() + companyName.slice(1),
-            tenant_description: `${companyName} company analysis`,
-            target_market: 'Market analysis in progress',
-            key_features: ['Feature analysis', 'Competitive intelligence', 'Market positioning']
-          }
-        }
-        tenantSent = true
-        await sleep(1000) // 模拟延迟
-      }
-
-      if (!competitorsSent && status.progress >= 75) {
-        // 发送竞争对手信息（模拟数据）
-        yield {
-          stage: 'competitors',
-          data: {
-            competitors: [
-              {
-                id: 'competitor_1',
-                display_name: 'Competitor Analysis',
-                primary_url: 'https://competitor1.com',
-                brief_description: 'Competitive analysis in progress',
-                source: 'search',
-                confidence: 0.8,
-                demographics: 'Analysis pending'
-              }
-            ]
-          }
-        }
-        competitorsSent = true
-        await sleep(1000)
-      }
-
-      // 检查任务是否完成
-      if (status.status === 'completed') {
-        // 获取最终结果
-        const resultsResponse = await fetch(`${base}/api/results/${taskId}`)
-        if (resultsResponse.ok) {
-          const results: TaskResults = await resultsResponse.json()
-          
-          // 重新发送真实的租户数据（如果有）
-          if (results.results.tenant) {
-            yield {
-              stage: 'tenant',
-              data: transformTenantData(results.results.tenant)
-            }
-          }
-
-          // 重新发送真实的竞争对手数据
-          if (results.results.competitors && results.results.competitors.length > 0) {
-            yield {
-              stage: 'competitors',
-              data: transformCompetitorsData(results.results.competitors)
-            }
-          }
-
-          // 发送变化检测数据
-          if (!changesSent) {
-            yield {
-              stage: 'changes',
-              data: transformChangesData(
-                results.results.competitor_analysis,
-                results.results.competitors ?? []
-              )
-            }
-            changesSent = true
-          }
-        }
-        break
-      }
-
-      if (status.status === 'failed') {
-        throw new Error(`Analysis failed: ${status.message}`)
-      }
-
-      await sleep(2000) // 每2秒轮询一次
-    }
-
-  } catch (error) {
-    console.error('Analysis error:', error)
-    throw error
+  } finally {
+    socket.close()
   }
 }
 
-async function* streamDesignMock(companyName: string): AsyncGenerator<StageEvent, void, unknown> {
-  const cleanName = companyName || 'example-company'
-  const readableName = cleanName
-    .split('.')[0]
-    .replace(/[-_]/g, ' ')
-  const titleCaseName = readableName.charAt(0).toUpperCase() + readableName.slice(1)
-
-  const tenantPayload: TenantSummary = {
-    tenant_id: cleanName.toLowerCase().replace(/[^a-z0-9]/g, '_') || 'example_company',
-    tenant_url: `https://${cleanName}`,
-    tenant_name: titleCaseName || 'Example Company',
-    tenant_description: `${titleCaseName} helps modern teams orchestrate product launches with autonomous competitive intelligence.`,
-    target_market: 'B2B SaaS · Growth-stage teams',
-    key_features: ['Automated monitoring', 'Competitor diffing', 'Narrative-ready briefs']
-  }
-
-  const competitorsPayload: CompetitorsSummaryPayload = {
-    competitors: [
-      {
-        id: 'crayon.co',
-        display_name: 'Crayon',
-        primary_url: 'https://www.crayon.co',
-        brief_description: 'Enterprise platform for competitive intelligence battlecards and enablement.',
-        source: 'search',
-        confidence: 0.84,
-        demographics: 'Product marketing and enablement teams'
-      },
-      {
-        id: 'klue.com',
-        display_name: 'Klue',
-        primary_url: 'https://klue.com',
-        brief_description: 'Competitive intelligence hub that centralizes insights for revenue teams.',
-        source: 'search',
-        confidence: 0.81,
-        demographics: 'Mid-market to enterprise GTM orgs'
-      },
-      {
-        id: 'contify.com',
-        display_name: 'Contify',
-        primary_url: 'https://www.contify.com',
-        brief_description: 'Market and competitor intelligence platform with curated news feeds.',
-        source: 'search',
-        confidence: 0.77,
-        demographics: 'Market intelligence and strategy teams'
-      },
-      {
-        id: 'kompyte.com',
-        display_name: 'Kompyte',
-        primary_url: 'https://www.kompyte.com',
-        brief_description: 'Automates competitor monitoring to keep battlecards and messaging current.',
-        source: 'search',
-        confidence: 0.74,
-        demographics: 'Product marketing and sales enablement'
-      },
-      {
-        id: 'similarweb.com',
-        display_name: 'Similarweb',
-        primary_url: 'https://www.similarweb.com',
-        brief_description: 'Digital intelligence suite tracking web traffic, acquisition, and market share.',
-        source: 'search',
-        confidence: 0.7,
-        demographics: 'Growth, strategy, and analyst teams'
-      }
-    ]
-  }
-
-  const changesPayloads: Array<{ url: string; changes: Array<Omit<ChangeDetail, 'url'>> }> = [
-    {
-      url: 'https://signalforge.io/changelog/march',
-      changes: [
-        {
-          id: 'signalforge-1',
-          change_type: 'Added',
-          content: 'Launched “Signals Remix” – auto-generated competitive briefs from raw change logs.',
-          timestamp: new Date().toISOString(),
-          threat_level: 7,
-          why_matter: 'Directly overlaps with opp’s narrative summaries; expect higher deal pressure with ops teams.',
-          suggestions: 'Highlight opp’s multi-source ingestion and schedule demo blitz for active SignalForge overlaps.',
-          read_at: null,
-        },
-        {
-          id: 'signalforge-2',
-          change_type: 'Deleted',
-          content: 'Introduced usage-based tier starting at $59 seat/month for startups.',
-          timestamp: new Date().toISOString(),
-          threat_level: 5,
-          why_matter: 'Undercuts our entry plan—early-stage prospects may churn unless value gaps are explicit.',
-          suggestions: 'Bundle opp’s monitoring with advisory hours for seed companies; refresh comparison deck.',
-          read_at: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString(),
-        },
-        {
-          id: 'signalforge-3',
-          change_type: 'Modified',
-          content: 'Retired the legacy weekly PDF digest in favor of in-app digests.',
-          timestamp: new Date(Date.now() - 1000 * 60 * 45).toISOString(),
-          threat_level: 3,
-          why_matter: 'Signals stronger product focus on real-time experiences; lowers pressure for traditional brief formats.',
-          suggestions: 'Lean into our cross-channel export options for teams still needing static PDFs.',
-          read_at: null,
-        }
-      ]
+export async function fetchAnalysisProgress(taskId: string): Promise<AnalysisStreamEvent[]> {
+  const response = await fetch(`${API_BASE}/api/analyze/${encodeURIComponent(taskId)}/progress`, {
+    headers: {
+      ...getAuthHeaders(),
     },
-    {
-      url: 'https://glyphhq.com/blog/new-pricing',
-      changes: [
-        {
-          id: 'glyph-1',
-          change_type: 'Modified',
-          content: 'Homepage headline now positions Glyph HQ as “Autonomous GTM intelligence for product marketers”.',
-          timestamp: new Date().toISOString(),
-          threat_level: 6,
-          why_matter: 'Signals a narrative shift directly into opp’s value prop; expect more overlap in evaluation cycles.',
-          suggestions: 'Ship updated pitch slides contrasting opp’s data coverage and human-in-the-loop briefings.',
-          read_at: null,
-        },
-        {
-          id: 'glyph-2',
-          change_type: 'Added',
-          content: 'Released Chrome extension that snapshots competitor pricing pages weekly.',
-          timestamp: new Date().toISOString(),
-          threat_level: 4,
-          why_matter: 'Feature parity with opp’s scheduled monitors could dilute differentiation in SMB deals.',
-          suggestions: 'Highlight opp’s multi-source enrichment and roll out our own pricing monitor recipe for reps.',
-          read_at: null,
-        },
-        {
-          id: 'glyph-3',
-          change_type: 'Added',
-          content: 'Introduced Slack digest summarising top three detected changes per workspace daily.',
-          timestamp: new Date(Date.now() - 1000 * 60 * 120).toISOString(),
-          threat_level: 5,
-          why_matter: 'Raises expectations for native collaboration touchpoints that opp must match or exceed.',
-          suggestions: 'Prioritise our Slack workflow beta announcement in upcoming nurture emails.',
-          read_at: null,
-        }
-      ]
-    },
-    {
-      url: 'https://www.kompyte.com/product-updates',
-      changes: [
-        {
-          id: 'kompyte-1',
-          change_type: 'Added',
-          content: 'Shipped AI-generated battlecard summaries targeting enterprise sellers.',
-          timestamp: new Date().toISOString(),
-          threat_level: 8,
-          why_matter: 'Directly competes with opp’s differentiator; expect elevated enterprise bake-off frequency.',
-          suggestions: 'Accelerate case-study refreshes highlighting opp’s human QA loop on AI summaries.',
-          read_at: null,
-        },
-        {
-          id: 'kompyte-2',
-          change_type: 'Modified',
-          content: 'Published benchmark report citing 22% faster win/loss response times with Kompyte.',
-          timestamp: new Date(Date.now() - 1000 * 60 * 240).toISOString(),
-          threat_level: 6,
-          why_matter: 'Arms sales teams with fresh ROI proof that may appear in competitive deals.',
-          suggestions: 'Prepare counter-narrative with our customer time-to-insight metrics and executive quotes.',
-          read_at: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-        },
-        {
-          id: 'kompyte-3',
-          change_type: 'Deleted',
-          content: 'Deprecated Salesforce integration tier for Starter plans.',
-          timestamp: new Date(Date.now() - 1000 * 60 * 360).toISOString(),
-          threat_level: 4,
-          why_matter: 'Opens positioning gap for SMB teams needing native CRM sync— opportunity for opp to lean in.',
-          suggestions: 'Promote opp’s plug-and-play CRM connectors in outbound messaging to SMB pipeline.',
-          read_at: null,
-        }
-      ]
-    }
-  ]
+  })
 
-  await sleep(3000)
-  yield { stage: 'tenant', data: tenantPayload }
-
-  await sleep(3000)
-  yield { stage: 'competitors', data: competitorsPayload }
-
-  const combinedChangesPayload: ChangesSummaryPayload = {
-    changes: changesPayloads.flatMap((payload) =>
-      payload.changes.map<ChangeDetail>((change, index) => ({
-        id: change.id ?? `${payload.url}-change-${index}`,
-        url: payload.url,
-        change_type: change.change_type,
-        content: change.content,
-        timestamp: change.timestamp,
-        threat_level: change.threat_level,
-        why_matter: change.why_matter,
-        suggestions: change.suggestions,
-        read_at: change.read_at ?? null,
-      }))
-    )
-  }
-
-  await sleep(3000)
-  yield { stage: 'changes', data: combinedChangesPayload }
+  const data = await handleResponse<{ events: unknown[] }>(response)
+  return data.events
+    .map(normalizeEvent)
+    .filter((event): event is AnalysisStreamEvent => Boolean(event))
 }
 
-// 保持原有函数作为备用（如果需要直接调用流式mock API）
-export async function* streamOriginalMockRun(url: string): AsyncGenerator<StageEvent, void, unknown> {
-  const base = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
-  const target = url.startsWith('http') ? url : `${base}${url}`
-  const response = await fetch(target)
-  if (!response.body) throw new Error('No response body')
+function mapMonitor(raw: Record<string, unknown>): MonitorSummary {
+  return {
+    id: String(raw.id ?? ''),
+    name: String(raw.name ?? ''),
+    url: String(raw.url ?? ''),
+    createdAt: String(raw.created_at ?? new Date().toISOString()),
+    updatedAt: (raw.updated_at as string | null | undefined) ?? null,
+    lastRunAt: (raw.last_run_at as string | null | undefined) ?? null,
+    latestTaskId: (raw.latest_task_id as string | null | undefined) ?? null,
+    latestTaskStatus: (raw.latest_task_status as string | null | undefined) ?? null,
+    latestTaskProgress: typeof raw.latest_task_progress === 'number' ? raw.latest_task_progress : null,
+    archivedAt: (raw.archived_at as string | null | undefined) ?? null,
+    trackedCompetitorIds: Array.isArray(raw.tracked_competitor_ids)
+      ? (raw.tracked_competitor_ids as unknown[]).map((value) => String(value))
+      : [],
+    trackedCompetitorSlugs: Array.isArray(raw.tracked_competitor_slugs)
+      ? (raw.tracked_competitor_slugs as unknown[]).map((value) => String(value))
+      : [],
+  }
+}
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+function mapArchive(raw: Record<string, unknown>): ArchiveEntry {
+  return {
+    id: String(raw.id ?? ''),
+    title: String(raw.title ?? ''),
+    monitorId: raw.monitor_id ? String(raw.monitor_id) : null,
+    taskId: raw.task_id ? String(raw.task_id) : null,
+    createdAt: String(raw.created_at ?? new Date().toISOString()),
+    tenant: raw.tenant ?? null,
+    competitors: raw.competitors ?? null,
+    changes: raw.changes ?? null,
+    metadata: (raw.metadata as Record<string, unknown> | null | undefined) ?? null,
+  }
+}
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
+function buildWebSocketUrl(path: string, token?: string): string {
+  const base = new URL(API_BASE)
+  const protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
+  const target = new URL(path, base)
+  target.protocol = protocol
+  if (token) {
+    target.searchParams.set('token', token)
+  }
+  return target.toString()
+}
 
-    let newlineIndex
-    while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newlineIndex).trim()
-      buffer = buffer.slice(newlineIndex + 1)
-      if (!line) continue
-      yield JSON.parse(line)
+function normalizeEvent(payload: unknown): AnalysisStreamEvent | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+  const record = payload as Record<string, unknown>
+  const type = typeof record.type === 'string' ? (record.type as string) : 'stage'
+  const stageValue = typeof record.stage === 'string' ? record.stage : undefined
+  const progress = typeof record.progress === 'number' ? record.progress : undefined
+
+  if (type === 'stage' && (stageValue === 'tenant' || stageValue === 'competitors' || stageValue === 'changes')) {
+    return {
+      type: 'stage',
+      stage: stageValue,
+      data: record.data,
+      progress,
     }
   }
 
-  if (buffer.trim()) {
-    yield JSON.parse(buffer)
+  return {
+    type: 'status',
+    stage: stageValue ?? 'unknown',
+    progress,
+    message: typeof record.message === 'string' ? record.message : undefined,
+    data: record.data,
   }
+}
+
+function mapTrackedCompetitor(raw: Record<string, unknown>): TrackedCompetitor {
+  return {
+    id: coalesceString(raw.id, ''),
+    competitorId: typeof raw.competitor_id === 'string' ? raw.competitor_id : null,
+    displayName: coalesceString(raw.display_name, 'Unnamed competitor'),
+    primaryUrl: coalesceUrl(raw.primary_url),
+    briefDescription: coalesceString(raw.brief_description, ''),
+    source: coalesceString(raw.source, 'analysis'),
+    demographics: coalesceString(raw.demographics, ''),
+    confidence: typeof raw.confidence === 'number'
+      ? clamp(raw.confidence, 0, 1)
+      : undefined,
+  }
+}
+
+function coalesceString(value: unknown, fallback: string): string {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim()
+  }
+  return fallback
+}
+
+function coalesceUrl(value: unknown): string {
+  const raw = coalesceString(value, 'https://example.com')
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw
+  }
+  return `https://${raw.replace(/^\/+/, '')}`
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
 }

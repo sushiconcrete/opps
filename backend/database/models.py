@@ -13,7 +13,7 @@ def generate_uuid():
 class AnalysisTask(Base):
     """分析任务模型 - 存储所有分析任务"""
     __tablename__ = "analysis_tasks"
-    
+
     id = Column(String, primary_key=True, default=generate_uuid)
     company_name = Column(String, nullable=False)
     task_type = Column(String, default="analysis")  # 'analysis', 'monitoring'
@@ -25,10 +25,17 @@ class AnalysisTask(Base):
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+    latest_stage = Column(String, nullable=True)
+
+    user_id = Column(String, ForeignKey('users.id'), nullable=True, index=True)
+    monitor_id = Column(String, ForeignKey('monitors.id'), nullable=True, index=True)
+
     # 关系
     competitors = relationship("CompetitorRecord", back_populates="task", cascade="all, delete-orphan")
     tenant_competitors = relationship("TenantCompetitor", back_populates="task", cascade="all, delete-orphan")
+    monitor = relationship("Monitor", back_populates="tasks", foreign_keys=[monitor_id])
+    user = relationship("User", back_populates="analysis_tasks", foreign_keys=[user_id])
+    archive_entry = relationship("AnalysisArchive", back_populates="task", uselist=False)
 
 class Tenant(Base):
     """租户信息表 - 存储公司基础信息"""
@@ -91,7 +98,7 @@ class TenantCompetitor(Base):
 class CompetitorRecord(Base):
     """竞争对手记录 - 兼容现有代码，保留原有字段"""
     __tablename__ = "competitor_records"
-    
+
     id = Column(String, primary_key=True, default=generate_uuid)
     task_id = Column(String, ForeignKey('analysis_tasks.id'), nullable=False, index=True)
     domain = Column(String, nullable=False, index=True)
@@ -103,9 +110,60 @@ class CompetitorRecord(Base):
     source = Column(String, default="search")
     extra_data = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+
     # 关系
     task = relationship("AnalysisTask", back_populates="competitors")
+
+
+class Monitor(Base):
+    """监控实体 - 绑定用户与租户分析记录"""
+    __tablename__ = "monitors"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True, index=True)
+    name = Column(String, nullable=False)
+    url = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_run_at = Column(DateTime, nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    latest_task_id = Column(String, ForeignKey('analysis_tasks.id'), nullable=True, index=True)
+
+    user = relationship("User", back_populates="monitors")
+    tenant = relationship("Tenant")
+    tasks = relationship("AnalysisTask", back_populates="monitor", foreign_keys="AnalysisTask.monitor_id")
+    latest_task = relationship("AnalysisTask", foreign_keys=[latest_task_id], post_update=True)
+    tracked_competitors = relationship("MonitorCompetitor", back_populates="monitor", cascade="all, delete-orphan")
+    archives = relationship("AnalysisArchive", back_populates="monitor")
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'url', name='uq_monitor_user_url'),
+        Index('idx_monitor_user', 'user_id'),
+        Index('idx_monitor_tenant', 'tenant_id'),
+    )
+
+
+class MonitorCompetitor(Base):
+    """用户监控的竞争对手映射表"""
+    __tablename__ = "monitor_competitors"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    monitor_id = Column(String, ForeignKey('monitors.id'), nullable=False)
+    competitor_id = Column(String, ForeignKey('competitors.id'), nullable=False)
+    tracked = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    monitor = relationship("Monitor", back_populates="tracked_competitors")
+    competitor = relationship("Competitor")
+
+    __table_args__ = (
+        UniqueConstraint('monitor_id', 'competitor_id', name='uq_monitor_competitor'),
+        Index('idx_monitor_competitor_monitor', 'monitor_id'),
+        Index('idx_monitor_competitor_competitor', 'competitor_id'),
+    )
 
 class ChangeDetectionCache(Base):
     """变化检测缓存表 - 3天TTL"""
@@ -143,7 +201,7 @@ class ChangeDetectionCache(Base):
 class ChangeDetection(Base):
     """变化检测记录 - 原有实现保留"""
     __tablename__ = "change_detections"
-    
+
     id = Column(String, primary_key=True, default=generate_uuid)
     competitor_id = Column(String, nullable=False, index=True)
     url = Column(String, nullable=False)
@@ -153,6 +211,8 @@ class ChangeDetection(Base):
     why_matter = Column(Text)
     suggestions = Column(Text)
     detected_at = Column(DateTime, default=datetime.utcnow)
+    
+    read_receipts = relationship("ChangeReadReceipt", back_populates="change", cascade="all, delete-orphan")
 
 class ContentStorage(Base):
     """内容存储表 - 支持OngoingTracker的previous content存储"""
@@ -175,12 +235,51 @@ class ContentStorage(Base):
         """生成内容哈希"""
         import hashlib
         return hashlib.sha256(content.encode()).hexdigest()
+
+
+class ChangeReadReceipt(Base):
+    """记录用户已读的变化项"""
+    __tablename__ = "change_read_receipts"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    change_id = Column(String, ForeignKey('change_detections.id'), nullable=False, index=True)
+    read_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="read_receipts")
+    change = relationship("ChangeDetection", back_populates="read_receipts")
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'change_id', name='uq_user_change_read'),
+    )
+
+
+class AnalysisArchive(Base):
+    """归档的分析快照"""
+    __tablename__ = "analysis_archives"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    monitor_id = Column(String, ForeignKey('monitors.id'), nullable=True, index=True)
+    task_id = Column(String, ForeignKey('analysis_tasks.id'), nullable=True, index=True)
+    title = Column(String, nullable=False)
+    tenant_snapshot = Column(JSON)
+    competitor_snapshot = Column(JSON)
+    change_snapshot = Column(JSON)
+    metadata_json = Column(JSON)
+    search_text = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="archives")
+    monitor = relationship("Monitor", back_populates="archives")
+    task = relationship("AnalysisTask", back_populates="archive_entry")
     # 在你的 database/models.py 文件末尾添加这个User模型
 
 class User(Base):
     """用户认证模型 - OAuth登录用户"""
     __tablename__ = "users"
-    
+
     id = Column(String, primary_key=True, default=generate_uuid)
     email = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=False)
@@ -199,10 +298,15 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
-    
+
     # 额外数据
     extra_data = Column(JSON, nullable=True)
-    
+
+    monitors = relationship("Monitor", back_populates="user", cascade="all, delete-orphan")
+    analysis_tasks = relationship("AnalysisTask", back_populates="user")
+    read_receipts = relationship("ChangeReadReceipt", back_populates="user", cascade="all, delete-orphan")
+    archives = relationship("AnalysisArchive", back_populates="user", cascade="all, delete-orphan")
+
     # 索引优化
     __table_args__ = (
         Index('idx_user_email', 'email'),

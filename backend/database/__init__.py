@@ -60,12 +60,20 @@ try:
         cache_crud,
         content_storage_crud,
         enhanced_task_crud,
+        monitor_crud,
+        monitor_competitor_crud,
+        change_read_crud,
+        archive_crud,
         TenantCRUD,
         CompetitorCRUD,
         TenantCompetitorCRUD,
         ChangeDetectionCacheCRUD,
         ContentStorageCRUD,
-        EnhancedTaskCRUD
+        EnhancedTaskCRUD,
+        MonitorCRUD,
+        MonitorCompetitorCRUD,
+        ChangeReadCRUD,
+        ArchiveCRUD
     )
     ENHANCED_CRUD_AVAILABLE = True
     logger.info("增强CRUD操作导入成功")
@@ -167,7 +175,9 @@ class BackwardCompatibleTaskCRUD:
             status="queued",
             progress=0,
             message="Task queued",
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
+            user_id=kwargs.get("user_id"),
+            monitor_id=kwargs.get("monitor_id")
         )
         db.add(task)
         db.commit()
@@ -199,7 +209,12 @@ class BackwardCompatibleTaskCRUD:
                 task.message = message
             if results is not None:
                 task.results = results
-            
+
+            extra_fields = kwargs or {}
+            for field, value in extra_fields.items():
+                if hasattr(task, field):
+                    setattr(task, field, value)
+
             db.commit()
             db.refresh(task)
         return task
@@ -341,12 +356,85 @@ if not ENHANCED_CRUD_AVAILABLE:
         def create_task_with_tenant(self, db, company_name, tenant_data, config=None):
             # 使用基础任务创建
             return BackwardCompatibleTaskCRUD().create_task(db, company_name, config)
-        
+
         def save_competitors_with_mapping(self, db, task_id, tenant_id, competitors_data):
             # 使用基础竞争对手保存
             records = BackwardCompatibleCompetitorCRUD().save_competitors(db, task_id, competitors_data)
             return records, []  # 返回记录和空映射列表
-    
+
+    class MinimalMonitorCRUD:
+        @staticmethod
+        def list_monitors(db, user_id, include_archived=False):
+            logger.warning("Fallback: Monitor 列表不可用")
+            return []
+
+        @staticmethod
+        def get_monitor(db, monitor_id, user_id):
+            return None
+
+        @staticmethod
+        def create_monitor(db, user_id, url, name=None, tenant_id=None):
+            logger.warning("Fallback: 创建Monitor不可用")
+            return None
+
+        @staticmethod
+        def get_or_create_monitor(db, user_id, url, name=None, tenant_id=None):
+            return None
+
+        @staticmethod
+        def update_monitor_name(db, monitor, new_name):
+            return monitor
+
+        @staticmethod
+        def deactivate_monitor(db, monitor):
+            return None
+
+        @staticmethod
+        def set_latest_task(db, monitor, task_id):
+            return None
+
+        @staticmethod
+        def attach_tenant(db, monitor, tenant):
+            return None
+
+    class MinimalMonitorCompetitorCRUD:
+        @staticmethod
+        def set_tracking(db, monitor_id, competitor_id, tracked=True):
+            logger.warning("Fallback: 竞争对手跟踪不可用")
+            return None
+
+        @staticmethod
+        def remove_tracking(db, monitor_id, competitor_id):
+            return None
+
+        @staticmethod
+        def get_tracked_competitor_ids(db, monitor_id):
+            return []
+
+    class MinimalChangeReadCRUD:
+        @staticmethod
+        def mark_read(db, user_id, change_id):
+            logger.warning("Fallback: 已读状态不可用")
+            return None
+
+        @staticmethod
+        def bulk_mark_read(db, user_id, change_ids):
+            return 0
+
+        @staticmethod
+        def fetch_read_ids(db, user_id, change_ids):
+            return []
+
+    class MinimalArchiveCRUD:
+        @staticmethod
+        def list_archives(db, user_id):
+            logger.warning("Fallback: 归档不可用")
+            return []
+
+        @staticmethod
+        def create_archive(db, user_id, monitor_id, task_id, title, tenant_snapshot, competitor_snapshot, change_snapshot, metadata, search_text):
+            return None
+
     # 分配最小实现
     tenant_crud = MinimalTenantCRUD()
     competitor_crud = MinimalCompetitorCRUD()
@@ -354,7 +442,11 @@ if not ENHANCED_CRUD_AVAILABLE:
     cache_crud = MinimalCacheCRUD()
     content_storage_crud = MinimalContentCRUD()
     enhanced_task_crud = MinimalEnhancedTaskCRUD()
-    
+    monitor_crud = MinimalMonitorCRUD()
+    monitor_competitor_crud = MinimalMonitorCompetitorCRUD()
+    change_read_crud = MinimalChangeReadCRUD()
+    archive_crud = MinimalArchiveCRUD()
+
     # 类引用
     TenantCRUD = MinimalTenantCRUD
     CompetitorCRUD = MinimalCompetitorCRUD
@@ -362,6 +454,10 @@ if not ENHANCED_CRUD_AVAILABLE:
     ChangeDetectionCacheCRUD = MinimalCacheCRUD
     ContentStorageCRUD = MinimalContentCRUD
     EnhancedTaskCRUD = MinimalEnhancedTaskCRUD
+    MonitorCRUD = MinimalMonitorCRUD
+    MonitorCompetitorCRUD = MinimalMonitorCompetitorCRUD
+    ChangeReadCRUD = MinimalChangeReadCRUD
+    ArchiveCRUD = MinimalArchiveCRUD
 
 # 基础CRUD实例（总是可用）
 task_crud = BackwardCompatibleTaskCRUD()
@@ -454,12 +550,14 @@ __all__ = [
     'ChangeDetectionCacheManager', 'ContentCacheManager',
     
     # 增强CRUD（可能是fallback）
-    'tenant_crud', 'competitor_crud', 'tenant_competitor_crud',
-    'cache_crud', 'content_storage_crud', 'enhanced_task_crud',
-    
-    # CRUD类
-    'TenantCRUD', 'CompetitorCRUD', 'TenantCompetitorCRUD',
-    'ChangeDetectionCacheCRUD', 'ContentStorageCRUD', 'EnhancedTaskCRUD',
+        'tenant_crud', 'competitor_crud', 'tenant_competitor_crud',
+        'cache_crud', 'content_storage_crud', 'enhanced_task_crud',
+        'monitor_crud', 'monitor_competitor_crud', 'change_read_crud', 'archive_crud',
+
+        # CRUD类
+        'TenantCRUD', 'CompetitorCRUD', 'TenantCompetitorCRUD',
+        'ChangeDetectionCacheCRUD', 'ContentStorageCRUD', 'EnhancedTaskCRUD',
+        'MonitorCRUD', 'MonitorCompetitorCRUD', 'ChangeReadCRUD', 'ArchiveCRUD',
     
     # 基础CRUD（总是可用）
     'task_crud', 'basic_competitor_crud', 'change_crud',

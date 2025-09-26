@@ -1,6 +1,6 @@
 # backend/database/crud.py
 """Enhanced CRUD operations with proper foreign key handling"""
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import desc, and_, or_, func
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
@@ -494,6 +494,239 @@ class EnhancedTaskCRUD:
             logger.error(f"Error saving competitors with mapping: {e}")
             raise
 
+class MonitorCRUD:
+    """Monitor CRUD operations"""
+
+    @staticmethod
+    def list_monitors(db: Session, user_id: str, include_archived: bool = False) -> List[models.Monitor]:
+        query = db.query(models.Monitor).options(
+            selectinload(models.Monitor.latest_task),
+            selectinload(models.Monitor.tracked_competitors).selectinload(models.MonitorCompetitor.competitor),
+        ).filter(
+            models.Monitor.user_id == user_id
+        )
+        if not include_archived:
+            query = query.filter(
+                models.Monitor.is_active.is_(True),
+                models.Monitor.archived_at.is_(None)
+            )
+        return query.order_by(models.Monitor.created_at.desc()).all()
+
+    @staticmethod
+    def get_monitor(db: Session, monitor_id: str, user_id: str) -> Optional[models.Monitor]:
+        return db.query(models.Monitor).options(
+            selectinload(models.Monitor.latest_task),
+            selectinload(models.Monitor.tracked_competitors).selectinload(models.MonitorCompetitor.competitor),
+        ).filter(
+            models.Monitor.id == monitor_id,
+            models.Monitor.user_id == user_id
+        ).first()
+
+    @staticmethod
+    def create_monitor(
+        db: Session,
+        user_id: str,
+        url: str,
+        name: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> models.Monitor:
+        normalized_url = url.strip()
+        monitor = models.Monitor(
+            user_id=user_id,
+            url=normalized_url,
+            name=name or normalized_url,
+            tenant_id=tenant_id,
+            is_active=True
+        )
+        db.add(monitor)
+        db.commit()
+        db.refresh(monitor)
+        return monitor
+
+    @staticmethod
+    def get_or_create_monitor(
+        db: Session,
+        user_id: str,
+        url: str,
+        name: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> models.Monitor:
+        monitor = db.query(models.Monitor).filter(
+            models.Monitor.user_id == user_id,
+            models.Monitor.url == url.strip()
+        ).first()
+        if monitor:
+            if name and monitor.name != name:
+                monitor.name = name
+            if tenant_id and monitor.tenant_id != tenant_id:
+                monitor.tenant_id = tenant_id
+            monitor.is_active = True
+            monitor.archived_at = None
+            monitor.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(monitor)
+            return monitor
+        return MonitorCRUD.create_monitor(db, user_id, url, name=name, tenant_id=tenant_id)
+
+    @staticmethod
+    def update_monitor_name(db: Session, monitor: models.Monitor, new_name: str) -> models.Monitor:
+        monitor.name = new_name
+        monitor.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(monitor)
+        return monitor
+
+    @staticmethod
+    def deactivate_monitor(db: Session, monitor: models.Monitor) -> None:
+        monitor.is_active = False
+        monitor.archived_at = datetime.utcnow()
+        monitor.updated_at = datetime.utcnow()
+        db.commit()
+
+    @staticmethod
+    def set_latest_task(db: Session, monitor: models.Monitor, task_id: str) -> None:
+        monitor.latest_task_id = task_id
+        monitor.last_run_at = datetime.utcnow()
+        monitor.updated_at = datetime.utcnow()
+        db.commit()
+
+    @staticmethod
+    def attach_tenant(db: Session, monitor: models.Monitor, tenant: models.Tenant) -> None:
+        monitor.tenant_id = tenant.id
+        monitor.updated_at = datetime.utcnow()
+        db.commit()
+
+
+class MonitorCompetitorCRUD:
+    """Monitor competitor tracking"""
+
+    @staticmethod
+    def set_tracking(
+        db: Session,
+        monitor_id: str,
+        competitor_id: str,
+        tracked: bool = True
+    ) -> models.MonitorCompetitor:
+        record = db.query(models.MonitorCompetitor).filter(
+            models.MonitorCompetitor.monitor_id == monitor_id,
+            models.MonitorCompetitor.competitor_id == competitor_id
+        ).first()
+
+        if record:
+            record.tracked = tracked
+            record.updated_at = datetime.utcnow()
+        else:
+            record = models.MonitorCompetitor(
+                monitor_id=monitor_id,
+                competitor_id=competitor_id,
+                tracked=tracked
+            )
+            db.add(record)
+
+        db.commit()
+        db.refresh(record)
+        return record
+
+    @staticmethod
+    def remove_tracking(db: Session, monitor_id: str, competitor_id: str) -> None:
+        record = db.query(models.MonitorCompetitor).filter(
+            models.MonitorCompetitor.monitor_id == monitor_id,
+            models.MonitorCompetitor.competitor_id == competitor_id
+        ).first()
+        if record:
+            db.delete(record)
+            db.commit()
+
+    @staticmethod
+    def get_tracked_competitor_ids(db: Session, monitor_id: str) -> List[str]:
+        records = db.query(models.MonitorCompetitor).filter(
+            models.MonitorCompetitor.monitor_id == monitor_id,
+            models.MonitorCompetitor.tracked.is_(True)
+        ).all()
+        return [record.competitor_id for record in records]
+
+
+class ChangeReadCRUD:
+    """Change read receipt CRUD"""
+
+    @staticmethod
+    def mark_read(db: Session, user_id: str, change_id: str) -> models.ChangeReadReceipt:
+        record = db.query(models.ChangeReadReceipt).filter(
+            models.ChangeReadReceipt.user_id == user_id,
+            models.ChangeReadReceipt.change_id == change_id
+        ).first()
+
+        if record:
+            record.read_at = datetime.utcnow()
+        else:
+            record = models.ChangeReadReceipt(
+                user_id=user_id,
+                change_id=change_id,
+                read_at=datetime.utcnow()
+            )
+            db.add(record)
+
+        db.commit()
+        db.refresh(record)
+        return record
+
+    @staticmethod
+    def bulk_mark_read(db: Session, user_id: str, change_ids: List[str]) -> int:
+        count = 0
+        for change_id in change_ids:
+            ChangeReadCRUD.mark_read(db, user_id, change_id)
+            count += 1
+        return count
+
+    @staticmethod
+    def fetch_read_ids(db: Session, user_id: str, change_ids: List[str]) -> Dict[str, datetime]:
+        if not change_ids:
+            return {}
+        records = db.query(models.ChangeReadReceipt).filter(
+            models.ChangeReadReceipt.user_id == user_id,
+            models.ChangeReadReceipt.change_id.in_(change_ids)
+        ).all()
+        return {record.change_id: record.read_at for record in records}
+
+
+class ArchiveCRUD:
+    """Archive CRUD"""
+
+    @staticmethod
+    def list_archives(db: Session, user_id: str) -> List[models.AnalysisArchive]:
+        return db.query(models.AnalysisArchive).filter(
+            models.AnalysisArchive.user_id == user_id
+        ).order_by(models.AnalysisArchive.created_at.desc()).all()
+
+    @staticmethod
+    def create_archive(
+        db: Session,
+        user_id: str,
+        monitor_id: Optional[str],
+        task_id: Optional[str],
+        title: str,
+        tenant_snapshot: Optional[dict],
+        competitor_snapshot: Optional[List[dict]],
+        change_snapshot: Optional[List[dict]],
+        metadata: Optional[dict],
+        search_text: Optional[str]
+    ) -> models.AnalysisArchive:
+        archive = models.AnalysisArchive(
+            user_id=user_id,
+            monitor_id=monitor_id,
+            task_id=task_id,
+            title=title,
+            tenant_snapshot=tenant_snapshot,
+            competitor_snapshot=competitor_snapshot,
+            change_snapshot=change_snapshot,
+            metadata_json=metadata,
+            search_text=search_text
+        )
+        db.add(archive)
+        db.commit()
+        db.refresh(archive)
+        return archive
+
 # Create CRUD instances
 tenant_crud = TenantCRUD()
 competitor_crud = CompetitorCRUD()
@@ -501,3 +734,7 @@ tenant_competitor_crud = TenantCompetitorCRUD()
 cache_crud = ChangeDetectionCacheCRUD()
 content_storage_crud = ContentStorageCRUD()
 enhanced_task_crud = EnhancedTaskCRUD()
+monitor_crud = MonitorCRUD()
+monitor_competitor_crud = MonitorCompetitorCRUD()
+change_read_crud = ChangeReadCRUD()
+archive_crud = ArchiveCRUD()
