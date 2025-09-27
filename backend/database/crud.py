@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import desc, and_, or_, func
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from . import models
 import json
 import hashlib
@@ -498,12 +499,105 @@ class MonitorCRUD:
     """Monitor CRUD operations"""
 
     @staticmethod
+    def _ensure_str(value: Optional[str]) -> str:
+        return (value or "").strip()
+
+    @classmethod
+    def normalize_url(cls, url: Optional[str]) -> str:
+        """Return a normalized, scheme-less URL for consistent storage."""
+        cleaned = cls._ensure_str(url)
+        if not cleaned:
+            return ""
+
+        candidate = cleaned if cleaned.startswith(("http://", "https://")) else f"https://{cleaned}"
+        try:
+            parsed = urlparse(candidate)
+        except Exception:
+            return cleaned.lower()
+
+        host = (parsed.netloc or "").lower()
+        path = parsed.path.rstrip("/") if parsed.path else ""
+
+        if not host:
+            # Handle inputs that are not valid URLs (e.g., company names)
+            return parsed.path.strip().lower()
+
+        normalized = host
+        if path and path not in ("", "/"):
+            normalized = f"{normalized}{path}"
+
+        if parsed.query:
+            normalized = f"{normalized}?{parsed.query}"
+
+        if parsed.fragment:
+            normalized = f"{normalized}#{parsed.fragment}"
+
+        return normalized
+
+    @classmethod
+    def canonical_url(cls, url: Optional[str]) -> str:
+        """Ensure the URL includes a scheme for display or linking."""
+        normalized = cls.normalize_url(url)
+        target = normalized or cls._ensure_str(url)
+        if not target:
+            return ""
+        if target.startswith(("http://", "https://")):
+            return target
+        return f"https://{target}"
+
+    @classmethod
+    def display_domain(cls, url: Optional[str]) -> str:
+        """Return a hostname suitable for dropdown labels."""
+        candidate = cls.canonical_url(url)
+        if not candidate:
+            return ""
+        try:
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+            if host:
+                return host.replace("www.", "")
+        except Exception:
+            pass
+        return candidate.replace("http://", "").replace("https://", "")
+
+    @staticmethod
+    def clean_name(name: Optional[str]) -> str:
+        return (name or "").strip()
+
+    @classmethod
+    def derive_display_name(cls, url: Optional[str], fallback: Optional[str] = None) -> str:
+        candidate = cls.clean_name(fallback)
+        if candidate:
+            return candidate
+
+        canonical = cls.canonical_url(url)
+        if canonical:
+            try:
+                parsed = urlparse(canonical)
+                host = (parsed.hostname or "").replace("www.", "")
+                if host:
+                    primary = host.split(".")[0].replace("-", " ").strip()
+                    if primary:
+                        return primary.title()
+            except Exception:
+                pass
+
+        raw = cls._ensure_str(url)
+        if raw:
+            sanitized = raw.replace("http://", "").replace("https://", "").strip("/")
+            sanitized = sanitized.replace("-", " ").strip()
+            if sanitized:
+                return sanitized.title()
+
+        return "Untitled monitor"
+
+    @staticmethod
     def list_monitors(db: Session, user_id: str, include_archived: bool = False) -> List[models.Monitor]:
         query = db.query(models.Monitor).options(
             selectinload(models.Monitor.latest_task),
             selectinload(models.Monitor.tracked_competitors).selectinload(models.MonitorCompetitor.competitor),
         ).filter(
-            models.Monitor.user_id == user_id
+            models.Monitor.user_id == user_id  # 确保过滤user_id
         )
         if not include_archived:
             query = query.filter(
@@ -519,7 +613,7 @@ class MonitorCRUD:
             selectinload(models.Monitor.tracked_competitors).selectinload(models.MonitorCompetitor.competitor),
         ).filter(
             models.Monitor.id == monitor_id,
-            models.Monitor.user_id == user_id
+            models.Monitor.user_id == user_id  # 确保用户只能访问自己的monitor
         ).first()
 
     @staticmethod
@@ -530,11 +624,16 @@ class MonitorCRUD:
         name: Optional[str] = None,
         tenant_id: Optional[str] = None
     ) -> models.Monitor:
-        normalized_url = url.strip()
+        normalized_url = MonitorCRUD.normalize_url(url)
+        raw_url = MonitorCRUD._ensure_str(url)
+        stored_url = normalized_url or raw_url
+        cleaned_name = MonitorCRUD.clean_name(name)
+        if not cleaned_name:
+            cleaned_name = MonitorCRUD.derive_display_name(stored_url or raw_url)
         monitor = models.Monitor(
-            user_id=user_id,
-            url=normalized_url,
-            name=name or normalized_url,
+            user_id=user_id,  # 设置user_id
+            url=stored_url,
+            name=cleaned_name,
             tenant_id=tenant_id,
             is_active=True
         )
@@ -551,26 +650,59 @@ class MonitorCRUD:
         name: Optional[str] = None,
         tenant_id: Optional[str] = None
     ) -> models.Monitor:
-        monitor = db.query(models.Monitor).filter(
-            models.Monitor.user_id == user_id,
-            models.Monitor.url == url.strip()
-        ).first()
+        normalized_url = MonitorCRUD.normalize_url(url)
+        raw_url = MonitorCRUD._ensure_str(url)
+        candidate_urls = [value for value in {normalized_url, raw_url} if value]
+
+        query = db.query(models.Monitor).filter(
+            models.Monitor.user_id == user_id  # 确保过滤user_id
+        )
+
+        if candidate_urls:
+            query = query.filter(models.Monitor.url.in_(candidate_urls))
+        else:
+            query = query.filter(models.Monitor.url == "")
+
+        monitor = query.first()
+        
         if monitor:
-            if name and monitor.name != name:
-                monitor.name = name
+            updated = False
+
+            if normalized_url and monitor.url != normalized_url:
+                monitor.url = normalized_url
+                updated = True
+
+            cleaned_name = MonitorCRUD.clean_name(name)
+            if cleaned_name and monitor.name != cleaned_name:
+                monitor.name = cleaned_name
+                updated = True
+            elif not cleaned_name and not MonitorCRUD.clean_name(monitor.name):
+                fallback = MonitorCRUD.derive_display_name(normalized_url or raw_url)
+                if monitor.name != fallback:
+                    monitor.name = fallback
+                    updated = True
+
             if tenant_id and monitor.tenant_id != tenant_id:
                 monitor.tenant_id = tenant_id
-            monitor.is_active = True
-            monitor.archived_at = None
-            monitor.updated_at = datetime.utcnow()
-            db.commit()
-            db.refresh(monitor)
+                updated = True
+
+            if not monitor.is_active or monitor.archived_at is not None:
+                monitor.is_active = True
+                monitor.archived_at = None
+                updated = True
+
+            if updated:
+                monitor.updated_at = datetime.utcnow()
+                db.commit()
+                db.refresh(monitor)
             return monitor
+            
         return MonitorCRUD.create_monitor(db, user_id, url, name=name, tenant_id=tenant_id)
 
     @staticmethod
     def update_monitor_name(db: Session, monitor: models.Monitor, new_name: str) -> models.Monitor:
-        monitor.name = new_name
+        cleaned = MonitorCRUD.clean_name(new_name)
+        monitor.name = cleaned or MonitorCRUD.derive_display_name(monitor.url, new_name)
         monitor.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(monitor)
@@ -596,6 +728,69 @@ class MonitorCRUD:
         monitor.updated_at = datetime.utcnow()
         db.commit()
 
+class UserPreferencesCRUD:
+    """用户偏好设置CRUD"""
+    
+    @staticmethod
+    def get_or_create_preferences(db: Session, user_id: str) -> models.UserPreferences:
+        """获取或创建用户偏好设置"""
+        pref = db.query(models.UserPreferences).filter(
+            models.UserPreferences.user_id == user_id
+        ).first()
+        
+        if not pref:
+            pref = models.UserPreferences(
+                user_id=user_id,
+                change_view_threshold=0.0,
+                email_alert_threshold=7.0,
+                email_alerts_enabled=False
+            )
+            db.add(pref)
+            db.commit()
+            db.refresh(pref)
+        
+        return pref
+    
+    @staticmethod
+    def update_preferences(
+        db: Session, 
+        user_id: str, 
+        **kwargs
+    ) -> models.UserPreferences:
+        """更新用户偏好设置"""
+        pref = UserPreferencesCRUD.get_or_create_preferences(db, user_id)
+        
+        for key, value in kwargs.items():
+            if hasattr(pref, key):
+                setattr(pref, key, value)
+        
+        pref.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(pref)
+        return pref
+    
+    @staticmethod
+    def get_users_for_email_alerts(
+        db: Session, 
+        threshold: float = None
+    ) -> List[Tuple[models.User, models.UserPreferences]]:
+        """获取需要发送邮件提醒的用户"""
+        query = db.query(models.User, models.UserPreferences).join(
+            models.UserPreferences
+        ).filter(
+            models.UserPreferences.email_alerts_enabled == True,
+            models.User.is_active == True
+        )
+        
+        if threshold is not None:
+            query = query.filter(
+                models.UserPreferences.email_alert_threshold <= threshold
+            )
+        
+        return query.all()
+
+# 添加实例
+user_preferences_crud = UserPreferencesCRUD()
 
 class MonitorCompetitorCRUD:
     """Monitor competitor tracking"""

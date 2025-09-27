@@ -26,6 +26,7 @@ import {
   adaptTenantStage,
   adaptCompetitorStage,
   adaptChangeStage,
+  type AnalysisStreamEvent,
   type MonitorSummary,
   type ArchiveEntry,
   type TenantSnapshot,
@@ -221,6 +222,7 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
   const [isLoadingMonitorResults, setIsLoadingMonitorResults] = useState(false)
   const [trackedCompetitorIds, setTrackedCompetitorIds] = useState<string[]>([])
+  const [hasMonitorAccess, setHasMonitorAccess] = useState(false)
   const [archives, setArchives] = useState<ArchiveItem[]>([])
   const [archivesLoading, setArchivesLoading] = useState(false)
   const [isBulkMarkPending, setIsBulkMarkPending] = useState(false)
@@ -229,12 +231,50 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
   const [monitorForm, setMonitorForm] = useState({ url: '', name: '' })
 
   const streamRef = useRef<{ cancel: () => void } | null>(null)
+  const currentMonitorIdRef = useRef<string | null>(null)
+  const activeTaskIdRef = useRef<string | null>(null)
+  const loadMonitorsPromiseRef = useRef<Promise<void> | null>(null)
+  const loadArchivesPromiseRef = useRef<Promise<void> | null>(null)
 
-  const convertMonitor = useCallback((summary: MonitorSummary): Monitor => ({
-    ...summary,
-    trackedCompetitorIds: [...summary.trackedCompetitorIds],
-    trackedCompetitorSlugs: [...summary.trackedCompetitorSlugs],
-  }), [])
+  useEffect(() => {
+    currentMonitorIdRef.current = currentMonitorId
+  }, [currentMonitorId])
+
+  useEffect(() => {
+    activeTaskIdRef.current = activeTaskId
+  }, [activeTaskId])
+
+  const isAuthError = useCallback((error: unknown): boolean => {
+    if (!(error instanceof Error)) {
+      return false
+    }
+    const message = error.message.toLowerCase()
+    return (
+      message.includes('unauthorized') ||
+      message.includes('authentication') ||
+      message.includes('forbidden')
+    )
+  }, [])
+
+  const convertMonitor = useCallback((summary: MonitorSummary): Monitor => {
+    const displayName = summary.displayName?.trim() || summary.name
+    const displayDomain = summary.displayDomain?.trim() || summary.displayDomain
+    const canonicalUrl = summary.canonicalUrl?.trim() || summary.canonicalUrl
+
+    return {
+      ...summary,
+      name: displayName,
+      displayName,
+      displayDomain: displayDomain || undefined,
+      canonicalUrl: canonicalUrl || undefined,
+      trackedCompetitorIds: [...summary.trackedCompetitorIds],
+      trackedCompetitorSlugs: [...summary.trackedCompetitorSlugs],
+      trackedCompetitorCount:
+        typeof summary.trackedCompetitorCount === 'number'
+          ? summary.trackedCompetitorCount
+          : summary.trackedCompetitorIds.length,
+    }
+  }, [])
 
   const loadMonitorResults = useCallback(async (taskId?: string | null) => {
     if (!taskId) {
@@ -298,61 +338,133 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
   }, [])
 
   const loadMonitors = useCallback(async () => {
-    try {
-      const summaries = await fetchMonitors()
-      const mapped = summaries.map(convertMonitor)
-      setMonitors(mapped)
-
-      if (mapped.length === 0) {
-        setCurrentMonitorId(null)
-        setActiveTaskId(null)
-        setTenant(null)
-        setCompetitorCards([])
-        setChanges([])
-        setTrackedCompetitorIds([])
-        setView('form')
-        return
-      }
-
-      const preferred = mapped.find((monitor) => monitor.id === currentMonitorId) ?? mapped[0]
-      setCurrentMonitorId(preferred.id)
-      setTrackedCompetitorIds(preferred.trackedCompetitorIds)
-      setActiveCompany(preferred.url)
-
-      if (preferred.latestTaskId) {
-        setActiveTaskId(preferred.latestTaskId)
-        await loadMonitorResults(preferred.latestTaskId)
-        setView('results')
-      } else {
-        setActiveTaskId(null)
-        setTenant(null)
-        setCompetitorCards([])
-        setChanges([])
-        // User has monitors but no latest task: still show dashboard shell
-        setView('results')
-      }
-    } catch (err) {
-      console.error('Failed to load monitors', err)
-      setError(err instanceof Error ? err.message : 'Unable to load monitors')
+    if (loadMonitorsPromiseRef.current) {
+      return loadMonitorsPromiseRef.current
     }
-  }, [convertMonitor, currentMonitorId, loadMonitorResults])
+
+    const request = (async () => {
+      try {
+        const summaries = await fetchMonitors()
+        const mapped = summaries.map(convertMonitor)
+        setMonitors(mapped)
+        setHasMonitorAccess(true)
+
+        if (mapped.length === 0) {
+          if (!streamRef.current) {
+            setView((previous) => (previous === 'results' ? 'form' : previous))
+          }
+          if (currentMonitorIdRef.current !== null) {
+            setCurrentMonitorId(null)
+          }
+          if (activeTaskIdRef.current !== null) {
+            setActiveTaskId(null)
+          }
+          setTenant(null)
+          setCompetitorCards([])
+          setChanges([])
+          setTrackedCompetitorIds([])
+          return
+        }
+
+        const previousMonitorId = currentMonitorIdRef.current
+        const preferred = previousMonitorId
+          ? mapped.find((monitor) => monitor.id === previousMonitorId) ?? mapped[0]
+          : mapped[0]
+
+        if (!preferred) {
+          return
+        }
+
+        if (preferred.id !== previousMonitorId) {
+          setCurrentMonitorId(preferred.id)
+        }
+
+        const nextCompany = preferred.canonicalUrl ?? preferred.url ?? null
+        setActiveCompany((current) => (current === nextCompany ? current : nextCompany))
+
+        setTrackedCompetitorIds((current) =>
+          arraysEqual(current, preferred.trackedCompetitorIds) ? current : preferred.trackedCompetitorIds,
+        )
+
+        const latestTaskId = preferred.latestTaskId ?? null
+        if (latestTaskId) {
+          const shouldReloadResults = streamRef.current !== null || latestTaskId !== activeTaskIdRef.current
+          setActiveTaskId(latestTaskId)
+          if (shouldReloadResults) {
+            await loadMonitorResults(latestTaskId)
+          }
+          setView((previous) => (previous === 'results' ? previous : 'results'))
+        } else if (!streamRef.current) {
+          if (activeTaskIdRef.current !== null) {
+            setActiveTaskId(null)
+          }
+          setTenant(null)
+          setCompetitorCards([])
+          setChanges([])
+          setView((previous) => (previous === 'results' ? previous : 'results'))
+        }
+      } catch (err) {
+        console.error('Failed to load monitors', err)
+        if (isAuthError(err)) {
+          setHasMonitorAccess(false)
+        }
+        setError(err instanceof Error ? err.message : 'Unable to load monitors')
+      }
+    })()
+
+    loadMonitorsPromiseRef.current = request
+    try {
+      await request
+    } finally {
+      loadMonitorsPromiseRef.current = null
+    }
+  }, [convertMonitor, loadMonitorResults, isAuthError])
 
   const loadArchives = useCallback(async () => {
-    setArchivesLoading(true)
+    if (loadArchivesPromiseRef.current) {
+      return loadArchivesPromiseRef.current
+    }
+
+    const request = (async () => {
+      setArchivesLoading(true)
+      try {
+        const items = await fetchArchives()
+        setArchives(items)
+      } catch (err) {
+        console.error('Failed to load archives', err)
+      } finally {
+        setArchivesLoading(false)
+      }
+    })()
+
+    loadArchivesPromiseRef.current = request
     try {
-      const items = await fetchArchives()
-      setArchives(items)
-    } catch (err) {
-      console.error('Failed to load archives', err)
+      await request
     } finally {
-      setArchivesLoading(false)
+      loadArchivesPromiseRef.current = null
     }
   }, [])
+
+  const handlePrimaryCtaClick = useCallback(() => {
+    if (!isAuthenticated) {
+      onRequestAuth()
+      return
+    }
+    setView('results')
+    void loadMonitors()
+    void loadArchives()
+  }, [isAuthenticated, onRequestAuth, loadArchives, loadMonitors])
 
   useEffect(() => {
     loadMonitors()
     loadArchives()
   }, [loadMonitors, loadArchives])
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setHasMonitorAccess(false)
+    }
+  }, [isAuthenticated])
 
   // After successful authentication, refresh monitors/archives to decide view
   useEffect(() => {
@@ -390,6 +502,9 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
       await loadArchives()
     } catch (err) {
       console.error('Failed to delete monitor', err)
+      if (isAuthError(err)) {
+        setHasMonitorAccess(false)
+      }
       setError(err instanceof Error ? err.message : 'Unable to delete monitor')
     }
   }
@@ -403,7 +518,7 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
 
     streamRef.current?.cancel()
     setCurrentMonitorId(monitorId)
-    setActiveCompany(monitor.url)
+    setActiveCompany(monitor.canonicalUrl ?? monitor.url)
     setTrackedCompetitorIds(monitor.trackedCompetitorIds)
     try {
       await loadMonitorResults(monitor.latestTaskId ?? null)
@@ -420,10 +535,14 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
       const mapped = convertMonitor(updated)
       setMonitors((previous) => previous.map((monitor) => (monitor.id === monitorId ? mapped : monitor)))
       if (currentMonitorId === monitorId) {
-        setActiveCompany(mapped.url)
+        setActiveCompany(mapped.canonicalUrl ?? mapped.url)
       }
+      setHasMonitorAccess(true)
     } catch (err) {
       console.error('Failed to update monitor name', err)
+      if (isAuthError(err)) {
+        setHasMonitorAccess(false)
+      }
       setError(err instanceof Error ? err.message : 'Unable to rename monitor')
     }
   }
@@ -490,8 +609,11 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
     const trimmedUrl = url.trim()
     if (!trimmedUrl) return
 
+    const absoluteUrl = ensureAbsoluteUrl(trimmedUrl)
+
     // If not authenticated, redirect to login page instead of starting analysis
     if (!isAuthenticated) {
+      setHasMonitorAccess(false)
       onRequestAuth()
       setView("form")
       return
@@ -501,7 +623,7 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
     setError(null)
     setIsSubmitting(true)
     setIsLoadingMonitorResults(true)
-    setActiveCompany(trimmedUrl)
+    setActiveCompany(absoluteUrl)
     setResultsSession((session) => session + 1)
     setView("results")
     setTenant(null)
@@ -509,17 +631,77 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
     setChanges([])
     setTrackedCompetitorIds([])
 
-    let streamIterator: AsyncIterator<any> | null = null
+    const normalizedTarget = normalizeMonitorUrl(absoluteUrl)
+    const matchedMonitor = monitors.find((monitor) => {
+      const candidate = monitor.canonicalUrl ?? monitor.url ?? ""
+      return normalizeMonitorUrl(candidate) === normalizedTarget
+    })
+
+    setCurrentMonitorId(matchedMonitor ? matchedMonitor.id : null)
+
+    let streamIterator: AsyncIterator<AnalysisStreamEvent> | null = null
 
     try {
       const { taskId, monitorId } = await startAnalysis(trimmedUrl, {
-        monitorId: currentMonitorId ?? undefined,
-        tenantUrl: trimmedUrl,
+        monitorId: matchedMonitor?.id,
+        tenantUrl: absoluteUrl,
       })
 
+      setActiveTaskId(taskId)
+
       if (monitorId) {
+        const optimisticSummary: MonitorSummary = {
+          id: monitorId,
+          name:
+            matchedMonitor?.displayName ??
+            matchedMonitor?.name ??
+            toDisplayName(absoluteUrl),
+          displayName:
+            matchedMonitor?.displayName ?? toDisplayName(absoluteUrl),
+          displayDomain:
+            matchedMonitor?.displayDomain ?? formatDisplayUrl(absoluteUrl),
+          canonicalUrl: matchedMonitor?.canonicalUrl ?? absoluteUrl,
+          url: matchedMonitor?.url ?? absoluteUrl,
+          createdAt: matchedMonitor?.createdAt ?? new Date().toISOString(),
+          updatedAt: matchedMonitor?.updatedAt ?? null,
+          lastRunAt: matchedMonitor?.lastRunAt ?? null,
+          latestTaskId: taskId,
+          latestTaskStatus: 'running',
+          latestTaskProgress: 0,
+          archivedAt: matchedMonitor?.archivedAt ?? null,
+          trackedCompetitorIds: matchedMonitor?.trackedCompetitorIds ?? [],
+          trackedCompetitorSlugs: matchedMonitor?.trackedCompetitorSlugs ?? [],
+          trackedCompetitorCount: matchedMonitor?.trackedCompetitorCount ?? 0,
+          hasTenant: matchedMonitor?.hasTenant,
+        }
+
+        const optimisticMonitor = convertMonitor(optimisticSummary)
+
+        setMonitors((previous) => {
+          const existing = previous.find((monitor) => monitor.id === monitorId)
+          if (!existing) {
+            return [optimisticMonitor, ...previous]
+          }
+
+          const others = previous.filter((monitor) => monitor.id !== monitorId)
+          const merged = {
+            ...existing,
+            name: optimisticMonitor.name,
+            displayName: optimisticMonitor.displayName,
+            displayDomain: optimisticMonitor.displayDomain ?? existing.displayDomain,
+            canonicalUrl: optimisticMonitor.canonicalUrl ?? existing.canonicalUrl,
+            url: optimisticMonitor.url,
+            latestTaskId: taskId,
+            latestTaskStatus: 'running',
+            latestTaskProgress: 0,
+          }
+
+          return [merged, ...others]
+        })
+
         setCurrentMonitorId(monitorId)
-        setActiveTaskId(taskId)
+        setHasMonitorAccess(true)
+        setActiveCompany(optimisticMonitor.canonicalUrl ?? optimisticMonitor.url ?? absoluteUrl)
       }
 
       let cancelled = false
@@ -655,11 +837,12 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
 
       setCurrentMonitorId(mapped.id)
       setTrackedCompetitorIds(mapped.trackedCompetitorIds)
-      setActiveCompany(mapped.url)
+      setActiveCompany(mapped.canonicalUrl ?? mapped.url)
       setActiveTaskId(mapped.latestTaskId ?? null)
       setTenant(null)
       setCompetitorCards([])
       setChanges([])
+      setHasMonitorAccess(true)
 
       if (mapped.latestTaskId) {
         await loadMonitorResults(mapped.latestTaskId)
@@ -670,6 +853,9 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
       setMonitorForm({ url: '', name: '' })
     } catch (err) {
       console.error('Failed to create monitor', err)
+      if (isAuthError(err)) {
+        setHasMonitorAccess(false)
+      }
       setError(err instanceof Error ? err.message : 'Unable to create monitor')
     } finally {
       setIsCreatingMonitor(false)
@@ -691,10 +877,10 @@ export function ImageCombiner({ onRequestAuth, isAuthenticated = false }: ImageC
           <div className="absolute right-6 top-6 z-20 flex items-center gap-2 sm:gap-3">
             <Button
               type="button"
-              onClick={onRequestAuth}
+              onClick={handlePrimaryCtaClick}
               className="h-9 rounded-full bg-gradient-to-br from-[#2563EB] via-[#2563EB] to-[#1D4ED8] px-4 text-sm font-semibold text-white shadow-lg transition hover:from-[#1D4ED8] hover:to-[#1E40AF]"
             >
-              Sign up
+              {isAuthenticated && hasMonitorAccess ? 'Dashboard' : 'Sign up'}
             </Button>
             <ModeToggle />
           </div>
@@ -1170,7 +1356,9 @@ function MonitorDropdown({
 }: MonitorDropdownProps) {
   const [editingMonitorId, setEditingMonitorId] = useState<string | null>(null)
   const currentMonitor = monitors.find(monitor => monitor.id === currentMonitorId)
-  const displayText = currentMonitor ? currentMonitor.name : "Select Monitor"
+  const displayText = currentMonitor
+    ? currentMonitor.displayName ?? currentMonitor.name
+    : "Select Monitor"
 
   const resetEditing = () => setEditingMonitorId(null)
 
@@ -1276,6 +1464,11 @@ function MonitorDropdownRow({
   onCancel,
 }: MonitorDropdownRowProps) {
   const itemRef = useRef<HTMLDivElement | null>(null)
+  const rawDomainSource = monitor.canonicalUrl ?? monitor.url ?? ''
+  const derivedDomain = rawDomainSource ? formatDisplayUrl(rawDomainSource) : '—'
+  const domainLabel = monitor.displayDomain ?? derivedDomain
+  const competitorTotal = monitor.trackedCompetitorCount ?? monitor.trackedCompetitorIds.length
+  const secondaryText = competitorTotal > 0 ? `${domainLabel} • ${competitorTotal} tracked` : domainLabel
 
   return (
     <DropdownMenuItem
@@ -1293,7 +1486,7 @@ function MonitorDropdownRow({
           isEditing={isEditing}
           getBoundaryElement={() => itemRef.current}
         />
-        <span className="text-xs text-muted-foreground">{formatDisplayUrl(monitor.url)}</span>
+        <span className="text-xs text-muted-foreground">{secondaryText}</span>
       </div>
       <div className="ml-2 flex items-center gap-1">
         <button
@@ -1948,12 +2141,59 @@ function insightFromTracked(record: TrackedCompetitor): CompetitorInsight {
   }
 }
 
+function arraysEqual<T>(left: T[], right: T[]): boolean {
+  if (left.length !== right.length) {
+    return false
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false
+    }
+  }
+  return true
+}
+
 function ensureAbsoluteUrl(raw: string): string {
   if (!raw) return ''
   if (raw.startsWith('http://') || raw.startsWith('https://')) {
     return raw
   }
   return `https://${raw}`
+}
+
+// Mirrors backend normalization so we can safely compare monitor URLs client-side.
+function normalizeMonitorUrl(raw: string): string {
+  const candidate = raw.trim()
+  if (!candidate) {
+    return ''
+  }
+
+  try {
+    const url = new URL(ensureAbsoluteUrl(candidate))
+    const host = (url.hostname || '').toLowerCase()
+
+    if (!host) {
+      return candidate.toLowerCase()
+    }
+
+    let normalized = host
+    const path = url.pathname.replace(/\/+$/, '')
+    if (path && path !== '/') {
+      normalized += path
+    }
+
+    if (url.search) {
+      normalized += url.search
+    }
+
+    if (url.hash) {
+      normalized += url.hash
+    }
+
+    return normalized
+  } catch {
+    return candidate.toLowerCase()
+  }
 }
 
 function extractCompetitorId(rawUrl: string): string {

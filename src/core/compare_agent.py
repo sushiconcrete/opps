@@ -113,9 +113,9 @@ async def compare_agent_call(diff: str, url: str):
     result = await structured_model.ainvoke(messages)
     return result
 
-# ===== 增强版：集成缓存机制的变化检测器 =====
-async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20, enable_caching: bool = True) -> Dict:
-    """集成缓存机制的变化检测器
+# ===== 【核心修复】：重命名并优化变化检测函数 =====
+async def change_detection_node(state: CompetitorState, day_delta: int = 20, enable_caching: bool = True) -> Dict:
+    """变化检测节点函数 - 修复版本，解决递归引用问题
     
     Args:
         state: 竞争对手状态，包含需要检测的竞争对手列表
@@ -125,20 +125,47 @@ async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20
     Returns:
         包含变化结果的字典
     """
+    logger.info(f"开始变化检测节点: enable_caching={enable_caching}")
+    
     competitors = state.get("competitors", [])
     if not competitors:
+        logger.warning("变化检测节点: 没有竞争对手数据")
         return {"changes": []}
     
-    # 构建URL-竞争对手ID映射
+    # 【修复】：统一数据格式验证，确保访问一致性
+    valid_competitors = []
     url_competitor_pairs = []
-    for competitor in competitors:
-        if hasattr(competitor, 'primary_url') and competitor.primary_url:
-            comp_id = getattr(competitor, 'id', f"comp_{competitor.primary_url}")
-            url_competitor_pairs.append((competitor.primary_url, comp_id))
     
-    if not url_competitor_pairs:
-        logger.warning("没有有效的竞争对手URL")
+    for i, competitor in enumerate(competitors):
+        try:
+            # 【修复】：统一数据访问方式，支持对象和字典
+            if isinstance(competitor, dict):
+                comp_url = competitor.get('primary_url', '')
+                comp_id = competitor.get('competitor_id', competitor.get('id', f"comp_{i}"))
+                comp_name = competitor.get('display_name', 'Unknown')
+            else:
+                # 处理对象类型
+                comp_url = getattr(competitor, 'primary_url', '')
+                comp_id = getattr(competitor, 'competitor_id', getattr(competitor, 'id', f"comp_{i}"))
+                comp_name = getattr(competitor, 'display_name', 'Unknown')
+            
+            # 【修复】：严格URL验证
+            if comp_url and isinstance(comp_url, str) and comp_url.startswith('http'):
+                valid_competitors.append(competitor)
+                url_competitor_pairs.append((comp_url, comp_id))
+                logger.info(f"变化检测节点 - 有效竞争对手: {comp_name} -> {comp_url}")
+            else:
+                logger.warning(f"变化检测节点 - 跳过无效URL: {comp_name} - URL: '{comp_url}' (type: {type(comp_url)})")
+        
+        except Exception as e:
+            logger.error(f"变化检测节点 - 处理竞争对手数据时出错: {e}", exc_info=True)
+            continue
+    
+    if not valid_competitors:
+        logger.warning("变化检测节点: 没有有效的竞争对手URL")
         return {"changes": []}
+    
+    logger.info(f"变化检测节点: 将检测 {len(valid_competitors)} 个有效竞争对手")
     
     # ===== 步骤1：检查缓存 =====
     cached_results = {}
@@ -146,7 +173,7 @@ async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20
     
     if enable_caching:
         try:
-            logger.info(f"检查缓存: {len(url_competitor_pairs)} 个URL")
+            logger.info(f"变化检测节点: 检查缓存 - {len(url_competitor_pairs)} 个URL")
             cached_results = await change_detection_cache.get_cached_results(url_competitor_pairs)
             
             # 过滤出需要重新检测的URL
@@ -155,10 +182,10 @@ async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20
                 if url not in cached_results
             ]
             
-            logger.info(f"缓存命中: {len(cached_results)} 个URL, 需要检测: {len(uncached_pairs)} 个URL")
+            logger.info(f"变化检测节点: 缓存命中 {len(cached_results)} 个URL, 需要检测 {len(uncached_pairs)} 个URL")
         
         except Exception as e:
-            logger.warning(f"查询缓存失败: {e}")
+            logger.warning(f"变化检测节点: 查询缓存失败: {e}")
             # 缓存失败时继续正常流程
             uncached_pairs = url_competitor_pairs
     
@@ -169,86 +196,81 @@ async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20
         # 提取需要检测的URL
         uncached_urls = [url for url, _ in uncached_pairs]
         
-        # 创建临时的竞争对手列表用于检测
-        uncached_competitors = []
-        for url, comp_id in uncached_pairs:
-            # 找到对应的原始竞争对手对象
-            for comp in competitors:
-                if hasattr(comp, 'primary_url') and comp.primary_url == url:
-                    uncached_competitors.append(comp)
-                    break
+        logger.info(f"变化检测节点: 开始检测 {len(uncached_urls)} 个未缓存URL")
         
-        if uncached_competitors:
-            logger.info(f"开始检测 {len(uncached_competitors)} 个未缓存的竞争对手")
+        # 使用原有的检测逻辑
+        tracker = ArchiveTracker()
+        
+        # 限制并发LLM调用避免触发速率限制
+        sem = asyncio.Semaphore(3)
+        tasks: List[asyncio.Task] = []
+        
+        async def _process(update: Dict):
+            # 跳过没有有意义diff的项目
+            diff_text = (update.get("gitdiff") or "").strip()
+            if not diff_text or diff_text.lower().startswith("no change"):
+                return None
             
-            # 使用原有的检测逻辑
-            tracker = ArchiveTracker()
-            
-            # 限制并发LLM调用避免触发速率限制
-            sem = asyncio.Semaphore(3)
-            tasks: List[asyncio.Task] = []
-            
-            async def _process(update: Dict):
-                # 跳过没有有意义diff的项目
-                diff_text = (update.get("gitdiff") or "").strip()
-                if not diff_text or diff_text.lower().startswith("no change"):
+            async with sem:
+                try:
+                    return await compare_agent_call(diff_text, update.get("url"))
+                except Exception as e:
+                    logger.error(f"变化检测节点: 处理变化检测失败 {update.get('url')}: {e}")
                     return None
-                
-                async with sem:
-                    try:
-                        return await compare_agent_call(diff_text, update.get("url"))
-                    except Exception as e:
-                        logger.error(f"处理变化检测失败 {update.get('url')}: {e}")
-                        return None
-            
-            # 使用流式检测获得更快的响应
+        
+        # 使用流式检测获得更快的响应
+        try:
             async for update in tracker.compare_stream(uncached_urls, day_delta=day_delta):
-                tasks.append(asyncio.create_task(_process(update)))
-            
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # 过滤掉跳过的项目和异常
-                valid_results = []
-                for i, result in enumerate(results):
-                    if not isinstance(result, Exception) and result is not None:
-                        valid_results.append(result)
+                if update and update.get("url"):
+                    task = asyncio.create_task(_process(update))
+                    tasks.append((update.get("url"), task))
+        except Exception as e:
+            logger.error(f"变化检测节点: tracker.compare_stream失败: {e}")
+        
+        if tasks:
+            # 等待所有任务完成
+            for url, task in tasks:
+                try:
+                    result = await task
+                    if result is not None:
                         # 映射URL到结果用于缓存
-                        if i < len(uncached_pairs):
-                            url, comp_id = uncached_pairs[i]
-                            new_results[url] = result
-                
-                logger.info(f"新检测完成: {len(valid_results)} 个有效结果")
-                
-                # ===== 步骤3：缓存新结果 =====
-                if enable_caching and new_results:
-                    try:
-                        # 准备缓存数据
-                        cache_data = {}
-                        competitor_mapping = {}
-                        
-                        for url, result in new_results.items():
-                            # 找到对应的competitor_id
-                            comp_id = None
-                            for u, c_id in uncached_pairs:
-                                if u == url:
-                                    comp_id = c_id
-                                    break
-                            
-                            if comp_id:
-                                # 序列化结果
-                                result_dict = result.model_dump() if hasattr(result, 'model_dump') else result
-                                cache_data[url] = result_dict
-                                competitor_mapping[url] = comp_id
-                        
-                        if cache_data:
-                            cached_urls = await change_detection_cache.cache_results(
-                                cache_data, competitor_mapping
-                            )
-                            logger.info(f"缓存新检测结果: {len(cached_urls)} 个URL")
+                        new_results[url] = result
+                        logger.info(f"变化检测节点: 成功检测 {url}")
+                except Exception as e:
+                    logger.error(f"变化检测节点: 处理检测结果失败 {url}: {e}")
+                    continue
+            
+            logger.info(f"变化检测节点: 新检测完成 - {len(new_results)} 个有效结果")
+            
+            # ===== 步骤3：缓存新结果 =====
+            if enable_caching and new_results:
+                try:
+                    # 准备缓存数据
+                    cache_data = {}
+                    competitor_mapping = {}
                     
-                    except Exception as e:
-                        logger.warning(f"缓存新检测结果失败: {e}")
+                    for url, result in new_results.items():
+                        # 找到对应的competitor_id
+                        comp_id = None
+                        for u, c_id in uncached_pairs:
+                            if u == url:
+                                comp_id = c_id
+                                break
+                        
+                        if comp_id:
+                            # 序列化结果
+                            result_dict = result.model_dump() if hasattr(result, 'model_dump') else result
+                            cache_data[url] = result_dict
+                            competitor_mapping[url] = comp_id
+                    
+                    if cache_data:
+                        cached_urls = await change_detection_cache.cache_results(
+                            cache_data, competitor_mapping
+                        )
+                        logger.info(f"变化检测节点: 缓存新检测结果 - {len(cached_urls)} 个URL")
+                
+                except Exception as e:
+                    logger.warning(f"变化检测节点: 缓存新检测结果失败: {e}")
     
     # ===== 步骤4：合并缓存结果和新结果 =====
     all_results = {}
@@ -258,23 +280,28 @@ async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20
     # 转换为最终格式
     final_changes = list(all_results.values())
     
-    logger.info(f"变化检测完成: 总计 {len(final_changes)} 个结果 (缓存: {len(cached_results)}, 新检测: {len(new_results)})")
+    logger.info(f"变化检测节点完成: 总计 {len(final_changes)} 个结果 (缓存: {len(cached_results)}, 新检测: {len(new_results)})")
     
     return {"changes": final_changes}
 
 # ===== 保持向后兼容的原始函数 =====
-async def change_detector(state: CompetitorState, day_delta: int = 20) -> Dict:
+async def change_detector_with_cache(state: CompetitorState, day_delta: int = 20, enable_caching: bool = True) -> Dict:
+    """增强版：集成缓存机制的变化检测器 - 调用修复后的节点函数"""
+    return await change_detection_node(state, day_delta, enable_caching)
+
+async def change_detector_legacy(state: CompetitorState, day_delta: int = 20) -> Dict:
     """原始的变化检测器（向后兼容，默认启用缓存）"""
-    return await change_detector_with_cache(state, day_delta, enable_caching=True)
+    return await change_detection_node(state, day_delta, enable_caching=True)
 
 # ===== 新增：无缓存版本 =====
 async def change_detector_no_cache(state: CompetitorState, day_delta: int = 20) -> Dict:
     """无缓存版本的变化检测器"""
-    return await change_detector_with_cache(state, day_delta, enable_caching=False)
+    return await change_detection_node(state, day_delta, enable_caching=False)
 
-# ===== LangGraph构建 =====
+# ===== 【关键修复】：LangGraph构建 - 修复递归引用问题 =====
 agent_builder = StateGraph(CompetitorState)
-agent_builder.add_node("change_detector", change_detector)
+# 【修复】：使用正确的节点函数，避免递归引用
+agent_builder.add_node("change_detector", change_detection_node)
 agent_builder.add_edge(START, "change_detector")
 agent_builder.add_edge("change_detector", END)
 change_detector = agent_builder.compile()
@@ -289,11 +316,11 @@ def build_change_detector_with_cache_control(enable_caching: bool = True):
     Returns:
         编译后的LangGraph
     """
-    async def change_detector_node(state: CompetitorState) -> Dict:
-        return await change_detector_with_cache(state, 20, enable_caching)
+    async def change_detector_node_with_cache_control(state: CompetitorState) -> Dict:
+        return await change_detection_node(state, 20, enable_caching)
     
     builder = StateGraph(CompetitorState)
-    builder.add_node("change_detector", change_detector_node)
+    builder.add_node("change_detector", change_detector_node_with_cache_control)
     builder.add_edge(START, "change_detector")
     builder.add_edge("change_detector", END)
     return builder.compile()
@@ -312,7 +339,7 @@ async def clear_change_detection_cache():
 async def get_cache_statistics():
     """获取缓存统计信息"""
     try:
-        stats = change_detection_cache.get_cache_stats()
+        stats = await change_detection_cache.get_cache_stats()
         return stats
     except Exception as e:
         logger.error(f"获取缓存统计失败: {e}")
@@ -330,8 +357,9 @@ async def invalidate_url_cache(urls: List[str]):
     try:
         count = 0
         for url in urls:
-            if await change_detection_cache.invalidate_cache(url):
-                count += 1
+            if hasattr(change_detection_cache, 'invalidate_cache'):
+                if await change_detection_cache.invalidate_cache(url):
+                    count += 1
         
         logger.info(f"使缓存失效完成: {count}/{len(urls)} 个URL")
         return count

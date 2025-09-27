@@ -52,6 +52,7 @@ except ImportError as e:
     CACHE_MANAGERS_AVAILABLE = False
 
 # 导入CRUD操作
+# 导入CRUD操作
 try:
     from .crud import (
         tenant_crud,
@@ -64,6 +65,7 @@ try:
         monitor_competitor_crud,
         change_read_crud,
         archive_crud,
+        user_preferences_crud,  # 添加这行
         TenantCRUD,
         CompetitorCRUD,
         TenantCompetitorCRUD,
@@ -73,7 +75,8 @@ try:
         MonitorCRUD,
         MonitorCompetitorCRUD,
         ChangeReadCRUD,
-        ArchiveCRUD
+        ArchiveCRUD,
+        UserPreferencesCRUD  # 添加这行
     )
     ENHANCED_CRUD_AVAILABLE = True
     logger.info("增强CRUD操作导入成功")
@@ -262,8 +265,16 @@ class BackwardCompatibleCompetitorCRUD:
 class BackwardCompatibleChangeCRUD:
     """修复后的向后兼容的变化CRUD"""
     
-    def save_changes(self, db, competitor_id, url, changes_data):
-        """保存变化数据 - 修复版本"""
+    def save_changes(
+        self, 
+        db, 
+        competitor_id, 
+        url, 
+        changes_data, 
+        is_first=True, 
+        monitor_id=None
+    ):
+        """保存变化数据 - 增强版本"""
         from .models import ChangeDetection
         from datetime import datetime
         
@@ -287,7 +298,9 @@ class BackwardCompatibleChangeCRUD:
                     threat_level=change_data.get("threat_level", 5),
                     why_matter=change_data.get("why_matter", ""),
                     suggestions=change_data.get("suggestions", ""),
-                    detected_at=detected_at
+                    detected_at=detected_at,
+                    is_first=is_first,  # 新增
+                    monitor_id=monitor_id  # 新增
                 )
                 db.add(record)
                 records.append(record)
@@ -296,7 +309,7 @@ class BackwardCompatibleChangeCRUD:
             for record in records:
                 db.refresh(record)
             
-            logger.info(f"保存变化记录: {len(records)} 条记录, competitor_id={competitor_id}")
+            logger.info(f"保存变化记录: {len(records)} 条记录, competitor_id={competitor_id}, is_first={is_first}")
             return records
             
         except Exception as e:
@@ -328,6 +341,21 @@ if not ENHANCED_CRUD_AVAILABLE:
             logger.warning("Fallback: 竞争对手CRUD功能受限")
             return None, False
     
+    class MinimalUserPreferencesCRUD:
+        @staticmethod
+        def get_or_create_preferences(db, user_id):
+            logger.warning("Fallback: 用户偏好设置不可用")
+            return None
+        
+        @staticmethod
+        def update_preferences(db, user_id, **kwargs):
+            logger.warning("Fallback: 用户偏好设置更新不可用")
+            return None
+        
+        @staticmethod
+        def get_users_for_email_alerts(db, threshold=None):
+            return []
+        
     class MinimalTenantCompetitorCRUD:
         @staticmethod
         def link_tenant_competitors(db, tenant_id, competitors_data, task_id=None):
@@ -446,7 +474,8 @@ if not ENHANCED_CRUD_AVAILABLE:
     monitor_competitor_crud = MinimalMonitorCompetitorCRUD()
     change_read_crud = MinimalChangeReadCRUD()
     archive_crud = MinimalArchiveCRUD()
-
+    user_preferences_crud = MinimalUserPreferencesCRUD()
+    UserPreferencesCRUD = MinimalUserPreferencesCRUD
     # 类引用
     TenantCRUD = MinimalTenantCRUD
     CompetitorCRUD = MinimalCompetitorCRUD
@@ -553,12 +582,12 @@ __all__ = [
         'tenant_crud', 'competitor_crud', 'tenant_competitor_crud',
         'cache_crud', 'content_storage_crud', 'enhanced_task_crud',
         'monitor_crud', 'monitor_competitor_crud', 'change_read_crud', 'archive_crud',
-
+        'user_preferences_crud',  # 添加这行
         # CRUD类
         'TenantCRUD', 'CompetitorCRUD', 'TenantCompetitorCRUD',
         'ChangeDetectionCacheCRUD', 'ContentStorageCRUD', 'EnhancedTaskCRUD',
         'MonitorCRUD', 'MonitorCompetitorCRUD', 'ChangeReadCRUD', 'ArchiveCRUD',
-    
+        'UserPreferencesCRUD',  # 添加这行
     # 基础CRUD（总是可用）
     'task_crud', 'basic_competitor_crud', 'change_crud',
     

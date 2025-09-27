@@ -37,6 +37,9 @@ export interface MonitorSummary {
   id: string
   name: string
   url: string
+  displayName?: string
+  displayDomain?: string
+  canonicalUrl?: string
   createdAt: string
   updatedAt?: string | null
   lastRunAt?: string | null
@@ -46,6 +49,8 @@ export interface MonitorSummary {
   archivedAt?: string | null
   trackedCompetitorIds: string[]
   trackedCompetitorSlugs: string[]
+  trackedCompetitorCount?: number
+  hasTenant?: boolean
 }
 
 export interface ArchiveEntry {
@@ -555,6 +560,35 @@ export async function* streamAnalysisEvents(taskId: string): AsyncGenerator<Anal
   }
 }
 
+export interface ArchiveDetail extends ArchiveEntry {
+  stats?: {
+    competitors_count: number
+    changes_count: number
+    has_tenant?: boolean
+  }
+}
+
+export async function fetchArchiveDetail(archiveId: string): Promise<ArchiveDetail> {
+  const response = await fetch(`${API_BASE}/api/archives/${encodeURIComponent(archiveId)}`, {
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+
+  return handleResponse<ArchiveDetail>(response)
+}
+
+export async function deleteArchive(archiveId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/archives/${encodeURIComponent(archiveId)}`, {
+    method: 'DELETE',
+    headers: {
+      ...getAuthHeaders(),
+    },
+  })
+  
+  await handleResponse(response)
+}
+
 export async function fetchAnalysisProgress(taskId: string): Promise<AnalysisStreamEvent[]> {
   const response = await fetch(`${API_BASE}/api/analyze/${encodeURIComponent(taskId)}/progress`, {
     headers: {
@@ -569,10 +603,36 @@ export async function fetchAnalysisProgress(taskId: string): Promise<AnalysisStr
 }
 
 function mapMonitor(raw: Record<string, unknown>): MonitorSummary {
+  const trackedCompetitorIds = Array.isArray(raw.tracked_competitor_ids)
+    ? (raw.tracked_competitor_ids as unknown[]).map((value) => String(value))
+    : []
+  const trackedCompetitorSlugs = Array.isArray(raw.tracked_competitor_slugs)
+    ? (raw.tracked_competitor_slugs as unknown[]).map((value) => String(value))
+    : []
+
+  const nameFromResponse = typeof raw.name === 'string' ? raw.name : ''
+  const displayName = typeof raw.display_name === 'string' && raw.display_name.trim()
+    ? raw.display_name.trim()
+    : nameFromResponse.trim()
+  const urlValue = typeof raw.url === 'string' ? raw.url.trim() : ''
+
+  const canonicalUrl = typeof raw.canonical_url === 'string' && raw.canonical_url.trim()
+    ? raw.canonical_url.trim()
+    : undefined
+  const displayDomain = typeof raw.display_domain === 'string' && raw.display_domain.trim()
+    ? raw.display_domain.trim()
+    : undefined
+  const trackedCount = typeof raw.tracked_competitor_count === 'number'
+    ? raw.tracked_competitor_count
+    : undefined
+
   return {
     id: String(raw.id ?? ''),
-    name: String(raw.name ?? ''),
-    url: String(raw.url ?? ''),
+    name: displayName || nameFromResponse,
+    displayName: displayName || undefined,
+    displayDomain,
+    canonicalUrl,
+    url: urlValue,
     createdAt: String(raw.created_at ?? new Date().toISOString()),
     updatedAt: (raw.updated_at as string | null | undefined) ?? null,
     lastRunAt: (raw.last_run_at as string | null | undefined) ?? null,
@@ -580,12 +640,10 @@ function mapMonitor(raw: Record<string, unknown>): MonitorSummary {
     latestTaskStatus: (raw.latest_task_status as string | null | undefined) ?? null,
     latestTaskProgress: typeof raw.latest_task_progress === 'number' ? raw.latest_task_progress : null,
     archivedAt: (raw.archived_at as string | null | undefined) ?? null,
-    trackedCompetitorIds: Array.isArray(raw.tracked_competitor_ids)
-      ? (raw.tracked_competitor_ids as unknown[]).map((value) => String(value))
-      : [],
-    trackedCompetitorSlugs: Array.isArray(raw.tracked_competitor_slugs)
-      ? (raw.tracked_competitor_slugs as unknown[]).map((value) => String(value))
-      : [],
+    trackedCompetitorIds,
+    trackedCompetitorSlugs,
+    trackedCompetitorCount: trackedCount ?? trackedCompetitorIds.length,
+    hasTenant: typeof raw.has_tenant === 'boolean' ? raw.has_tenant : undefined,
   }
 }
 

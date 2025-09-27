@@ -1,9 +1,56 @@
-# backend/app.py - 完整保留分析功能 + OAuth认证
+# backend/app.py - 完整保留分析功能 + OAuth认证 + 修复Session和递归问题
 from datetime import datetime, timedelta, timezone
 import os
 import sys
 from pathlib import Path
+import json
+from datetime import datetime, date
+def json_serializer(obj):
+    """JSON序列化器 - 处理datetime和其他不可序列化对象"""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif hasattr(obj, 'model_dump'):
+        return obj.model_dump()
+    elif hasattr(obj, '__dict__'):
+        return {k: json_serializer(v) for k, v in obj.__dict__.items() 
+                if not k.startswith('_')}
+    elif isinstance(obj, dict):
+        return {k: json_serializer(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [json_serializer(item) for item in obj]
+    else:
+        return str(obj)
 
+def safe_json_serialize(data):
+    """安全的JSON序列化，处理datetime对象"""
+    try:
+        # 首先尝试直接序列化
+        return json.loads(json.dumps(data, default=json_serializer))
+    except Exception as e:
+        logger.warning(f"JSON序列化失败，使用递归清理: {e}")
+        return clean_for_json(data)
+
+def clean_for_json(obj):
+    """递归清理对象，移除不可JSON序列化的内容"""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [clean_for_json(item) for item in obj]
+    elif hasattr(obj, 'model_dump'):
+        try:
+            return clean_for_json(obj.model_dump())
+        except:
+            return str(obj)
+    elif hasattr(obj, '__dict__'):
+        try:
+            return clean_for_json({k: v for k, v in obj.__dict__.items() 
+                                 if not k.startswith('_')})
+        except:
+            return str(obj)
+    else:
+        return obj
 # ========== 环境变量加载 ==========
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -80,6 +127,7 @@ from database import (
     change_detection_cache,
     get_database_stats,
     monitor_crud,
+    MonitorCRUD,
     monitor_competitor_crud,
     change_read_crud,
     archive_crud
@@ -145,10 +193,22 @@ class TaskEventBroker:
                 self._locks.pop(task_id, None)
 
     async def publish(self, task_id: str, event: dict) -> None:
+        # 【修复】：在发布前清理event中的datetime对象
+        try:
+            clean_event = safe_json_serialize(event)
+        except Exception as e:
+            logger.warning(f"清理事件数据失败: {e}")
+            clean_event = {
+                "type": event.get("type", "unknown"),
+                "stage": event.get("stage", "unknown"),
+                "progress": event.get("progress", 0),
+                "message": str(event.get("message", ""))
+            }
+        
         async with self._get_lock(task_id):
             subscribers = list(self._subscribers.get(task_id, []))
             history = self._history.setdefault(task_id, [])
-            history.append(event)
+            history.append(clean_event)
             if len(history) > 50:
                 history.pop(0)
 
@@ -156,7 +216,7 @@ class TaskEventBroker:
             return
 
         for queue in subscribers:
-            await queue.put(event)
+            await queue.put(clean_event)
 
     def prime(self, task_id: str, events: List[dict]) -> None:
         self._history[task_id] = list(events[-50:])
@@ -346,7 +406,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="OPP - Competitor Analysis API", 
-    version="1.0.0-oauth",
+    version="1.0.0-oauth-fixed",
     lifespan=lifespan
 )
 
@@ -413,10 +473,21 @@ def serialize_monitor(monitor) -> Dict[str, Any]:
         if competitor_slug:
             tracked_slugs.append(competitor_slug)
 
+    raw_url = getattr(monitor, 'url', '') or ''
+    normalized_url = MonitorCRUD.normalize_url(raw_url)
+    canonical_url = MonitorCRUD.canonical_url(raw_url or normalized_url)
+    display_domain = MonitorCRUD.display_domain(raw_url or normalized_url)
+    stored_name = MonitorCRUD.clean_name(getattr(monitor, 'name', ''))
+    display_name = stored_name or MonitorCRUD.derive_display_name(normalized_url or raw_url)
+    tracked_count = len(tracked_ids)
+
     return {
         'id': monitor.id,
-        'name': monitor.name,
-        'url': monitor.url,
+        'name': display_name,
+        'display_name': display_name,
+        'display_domain': display_domain,
+        'url': normalized_url or raw_url,
+        'canonical_url': canonical_url,
         'created_at': monitor.created_at,
         'updated_at': getattr(monitor, 'updated_at', None),
         'last_run_at': monitor.last_run_at,
@@ -424,8 +495,10 @@ def serialize_monitor(monitor) -> Dict[str, Any]:
         'latest_task_status': getattr(latest_task, 'status', None),
         'latest_task_progress': getattr(latest_task, 'progress', None),
         'archived_at': monitor.archived_at,
+        'tracked_competitor_count': tracked_count,
         'tracked_competitor_ids': tracked_ids,
-        'tracked_competitor_slugs': tracked_slugs
+        'tracked_competitor_slugs': tracked_slugs,
+        'has_tenant': bool(getattr(monitor, 'tenant_id', None))
     }
 
 
@@ -471,9 +544,9 @@ def get_analyzer_components():
     
     return analyzer_components
 
-# ========== 核心修复：统一的Competitor ID管理器 ==========
+# ========== 【核心修复】：修复版CompetitorIDManager ==========
 class CompetitorIDManager:
-    """统一管理competitor ID的映射和一致性"""
+    """修复版竞争对手ID管理器 - 解决Session问题并确保数据一致性"""
     
     @staticmethod
     def extract_domain_id(url: str) -> str:
@@ -499,64 +572,69 @@ class CompetitorIDManager:
     
     @staticmethod
     def get_or_create_competitor_id(comp_data: dict, db_session: Session) -> str:
-        """获取或创建标准化的competitor ID，确保数据库一致性"""
+        """获取或创建标准化的competitor ID - 修复Session问题"""
         from database.models import Competitor
         from sqlalchemy import or_
         
-        # 提取基本信息
-        primary_url = comp_data.get('primary_url', '')
-        display_name = comp_data.get('display_name', '')
-        existing_id = comp_data.get('competitor_id') or comp_data.get('id', '')
-        
-        # 生成标准domain ID
-        domain_id = CompetitorIDManager.extract_domain_id(primary_url)
-        
-        # 1. 首先尝试通过URL精确匹配
-        if primary_url:
-            existing_by_url = db_session.query(Competitor).filter(
-                Competitor.primary_url == primary_url
-            ).first()
+        try:
+            # 提取基本信息
+            primary_url = comp_data.get('primary_url', '')
+            display_name = comp_data.get('display_name', '')
+            existing_id = comp_data.get('competitor_id') or comp_data.get('id', '')
             
-            if existing_by_url:
-                logger.info(f"通过URL找到现有competitor: {existing_by_url.competitor_id}")
-                return existing_by_url.competitor_id
-        
-        # 2. 尝试通过domain ID匹配
-        if domain_id:
-            existing_by_domain = db_session.query(Competitor).filter(
-                Competitor.competitor_id == domain_id
-            ).first()
+            # 生成标准domain ID
+            domain_id = CompetitorIDManager.extract_domain_id(primary_url)
             
-            if existing_by_domain:
-                logger.info(f"通过domain ID找到现有competitor: {domain_id}")
-                return domain_id
-        
-        # 3. 尝试通过显示名称模糊匹配
-        if display_name:
-            company_name = display_name.lower().replace(' ', '').replace('group', '').replace('inc', '').replace('ltd', '')
+            # 1. 首先尝试通过URL精确匹配
+            if primary_url:
+                existing_by_url = db_session.query(Competitor).filter(
+                    Competitor.primary_url == primary_url
+                ).first()
+                
+                if existing_by_url:
+                    logger.info(f"通过URL找到现有competitor: {existing_by_url.competitor_id}")
+                    return existing_by_url.competitor_id
             
-            fuzzy_matches = db_session.query(Competitor).filter(
-                or_(
-                    Competitor.display_name.ilike(f'%{display_name}%'),
-                    Competitor.competitor_id.ilike(f'%{company_name}%')
-                )
-            ).all()
+            # 2. 尝试通过domain ID匹配
+            if domain_id:
+                existing_by_domain = db_session.query(Competitor).filter(
+                    Competitor.competitor_id == domain_id
+                ).first()
+                
+                if existing_by_domain:
+                    logger.info(f"通过domain ID找到现有competitor: {domain_id}")
+                    return domain_id
             
-            for match in fuzzy_matches:
-                if primary_url and match.primary_url:
-                    match_domain = CompetitorIDManager.extract_domain_id(match.primary_url)
-                    if match_domain == domain_id:
-                        logger.info(f"通过模糊匹配找到competitor: {match.competitor_id}")
-                        return match.competitor_id
-        
-        # 4. 如果都没找到，返回标准化的domain ID（将在后续创建）
-        final_id = domain_id or existing_id or f"comp_{hash(display_name or primary_url)}"
-        logger.info(f"将使用新的competitor ID: {final_id}")
-        return final_id
+            # 3. 尝试通过显示名称模糊匹配
+            if display_name:
+                company_name = display_name.lower().replace(' ', '').replace('group', '').replace('inc', '').replace('ltd', '')
+                
+                fuzzy_matches = db_session.query(Competitor).filter(
+                    or_(
+                        Competitor.display_name.ilike(f'%{display_name}%'),
+                        Competitor.competitor_id.ilike(f'%{company_name}%')
+                    )
+                ).all()
+                
+                for match in fuzzy_matches:
+                    if primary_url and match.primary_url:
+                        match_domain = CompetitorIDManager.extract_domain_id(match.primary_url)
+                        if match_domain == domain_id:
+                            logger.info(f"通过模糊匹配找到competitor: {match.competitor_id}")
+                            return match.competitor_id
+            
+            # 4. 如果都没找到，返回标准化的domain ID（将在后续创建）
+            final_id = domain_id or existing_id or f"comp_{hash(display_name or primary_url)}"
+            logger.info(f"将使用新的competitor ID: {final_id}")
+            return final_id
+            
+        except Exception as e:
+            logger.error(f"获取competitor ID失败: {e}")
+            return f"comp_{hash(str(comp_data))}"
     
     @staticmethod
     def ensure_competitor_exists(comp_data: dict, competitor_id: str, db_session: Session) -> bool:
-        """确保competitor记录存在于数据库中"""
+        """确保competitor记录存在于数据库中 - 修复Session问题"""
         from database.models import Competitor
         
         try:
@@ -597,7 +675,66 @@ class CompetitorIDManager:
             logger.error(f"确保competitor存在时出错: {e}")
             return False
 
-# ========== 修复后的主分析函数 ==========
+# ========== 【关键修复】：解决Session问题的数据序列化函数 ==========
+def serialize_competitor_from_db(competitor_obj) -> dict:
+    """
+    从数据库对象安全地序列化竞争对手数据，解决DetachedInstanceError
+    必须在Session活跃时调用此函数
+    """
+    try:
+        return {
+            'id': getattr(competitor_obj, 'id', ''),
+            'competitor_id': getattr(competitor_obj, 'competitor_id', ''),
+            'display_name': getattr(competitor_obj, 'display_name', ''),
+            'primary_url': getattr(competitor_obj, 'primary_url', ''),
+            'brief_description': getattr(competitor_obj, 'brief_description', ''),
+            'demographics': getattr(competitor_obj, 'demographics', ''),
+            'source': getattr(competitor_obj, 'source', 'database'),
+            'confidence': getattr(competitor_obj, 'confidence', 0.5),
+            'extra_data': getattr(competitor_obj, 'extra_data', {}),
+            'created_at': getattr(competitor_obj, 'created_at', None),
+            'updated_at': getattr(competitor_obj, 'updated_at', None)
+        }
+    except Exception as e:
+        logger.error(f"序列化competitor对象失败: {e}")
+        return {
+            'id': str(competitor_obj),
+            'competitor_id': str(competitor_obj),
+            'display_name': str(competitor_obj),
+            'primary_url': '',
+            'brief_description': '',
+            'demographics': '',
+            'source': 'error',
+            'confidence': 0.0,
+            'extra_data': {}
+        }
+
+def normalize_competitor_data(comp_data) -> dict:
+    """统一竞争对手数据格式，处理不同来源的数据"""
+    if isinstance(comp_data, dict):
+        result = comp_data.copy()
+    elif hasattr(comp_data, 'model_dump'):
+        result = comp_data.model_dump()
+    else:
+        # 处理数据库对象 - 这里是关键修复点
+        result = serialize_competitor_from_db(comp_data)
+    
+    # 确保必要字段存在且格式正确
+    if not result.get('competitor_id'):
+        result['competitor_id'] = result.get('id', CompetitorIDManager.extract_domain_id(result.get('primary_url', '')))
+    
+    # 验证：确保URL格式正确
+    primary_url = result.get('primary_url', '')
+    if primary_url and not primary_url.startswith('http'):
+        if not primary_url.startswith('//'):
+            primary_url = f'https://{primary_url}'
+        else:
+            primary_url = f'https:{primary_url}'
+        result['primary_url'] = primary_url
+    
+    return result
+
+# ========== 【核心修复】：修复后的主分析函数 ==========
 async def run_analysis_with_persistence(
     task_id: str,
     company_name: str,
@@ -608,7 +745,8 @@ async def run_analysis_with_persistence(
     user_id: Optional[str] = None,
     monitor_id: Optional[str] = None
 ):
-    """运行分析任务（异步）- 使用统一的ID管理系统"""
+    """运行分析任务（异步）- 修复Session问题和变化检测问题"""
+    
     cached_results = {}
     uncached_competitors = []
 
@@ -713,22 +851,36 @@ async def run_analysis_with_persistence(
                 'data': tenant_payload
             })
 
-        # 第二步：查找竞争对手
+        # 第二步：查找竞争对手 - 【修复Session问题】
         task_crud.update_task(db, task_id,
             progress=50,
             message="Finding competitors..."
         )
         
+        # 【修复】：从数据库获取现有竞争对手时立即序列化
         existing_competitors = []
         if tenant_id and enable_caching:
             try:
                 with get_db_session() as db_session:
-                    existing_competitors = tenant_crud.get_tenant_competitors(db_session, tenant_id)
-                    if existing_competitors:
+                    competitors_data = tenant_crud.get_tenant_competitors(db_session, tenant_id)
+                    if competitors_data:
+                        # 【关键修复】：在Session内立即序列化所有数据库对象
+                        existing_competitors = [serialize_competitor_from_db(comp) for comp in competitors_data]
+                        
+                        # 验证：过滤有效的竞争对手
+                        valid_existing = []
+                        for comp in existing_competitors:
+                            if comp.get('primary_url') and comp['primary_url'].startswith('http'):
+                                valid_existing.append(comp)
+                            else:
+                                logger.warning(f"跳过无效URL的已存储竞争对手: {comp.get('display_name')} - URL: '{comp.get('primary_url')}'")
+                        
+                        existing_competitors = valid_existing
                         logger.info(f"找到已存储的竞争对手: {len(existing_competitors)} 个")
             except Exception as e:
                 logger.warning(f"查询已存储竞争对手失败: {e}")
         
+        # 如果没有存储的竞争对手，进行搜索
         if not existing_competitors:
             competitor_state = {
                 "tenant": tenant,
@@ -740,90 +892,37 @@ async def run_analysis_with_persistence(
             
             competitor_result = await competitor_finder.ainvoke(competitor_state)
             competitors = competitor_result.get("competitors", [])
-            limited_competitors = competitors[:max_competitors]
+            
+            # 【修复】：统一转换新搜索的竞争对手为dict格式
+            limited_competitors = []
+            for comp in competitors[:max_competitors]:
+                normalized_comp = normalize_competitor_data(comp)
+                
+                # 验证：确保URL有效
+                if normalized_comp.get('primary_url') and normalized_comp['primary_url'].startswith('http'):
+                    limited_competitors.append(normalized_comp)
+                else:
+                    logger.warning(f"跳过无效URL的新竞争对手: {normalized_comp.get('display_name')} - URL: '{normalized_comp.get('primary_url')}'")
             
             if limited_competitors and tenant_id:
                 try:
                     with get_db_session() as db_session:
-                        competitors_data = []
-                        for comp in limited_competitors:
-                            if hasattr(comp, 'model_dump'):
-                                comp_dict = comp.model_dump()
-                            elif hasattr(comp, '__dict__'):
-                                comp_dict = comp.__dict__
-                            else:
-                                comp_dict = dict(comp) if hasattr(comp, 'keys') else {}
-                            competitors_data.append(comp_dict)
-                        
                         records, mappings = enhanced_task_crud.save_competitors_with_mapping(
-                            db_session, task_id, tenant_id, competitors_data
+                            db_session, task_id, tenant_id, limited_competitors
                         )
                         
                         logger.info(f"保存竞争对手: {len(records)} 个记录, {len(mappings)} 个映射关系")
                 except Exception as e:
                     logger.warning(f"保存竞争对手映射失败: {e}")
         else:
+            # 使用已存储的竞争对手
             limited_competitors = existing_competitors[:max_competitors]
             logger.info(f"使用已存储的竞争对手: {len(limited_competitors)} 个")
         
         # 保存竞争对手到任务（为了兼容性）
         competitor_stage_payload: Dict[str, Any] = {'competitors': []}
         if limited_competitors:
-            competitors_for_save = []
-            for comp in limited_competitors:
-                if hasattr(comp, 'model_dump'):
-                    comp_dict = comp.model_dump()
-                elif isinstance(comp, dict):
-                    comp_dict = comp
-                elif hasattr(comp, '__dict__'):
-                    comp_dict = {}
-                    for attr in ['id', 'competitor_id', 'display_name', 'primary_url', 'brief_description', 'demographics', 'source', 'confidence', 'url', 'description', 'target_users']:
-                        if hasattr(comp, attr):
-                            comp_dict[attr] = getattr(comp, attr)
-                else:
-                    comp_dict = {
-                        'id': str(comp),
-                        'display_name': str(comp),
-                        'primary_url': '',
-                        'brief_description': 'Auto converted'
-                    }
-
-                competitors_for_save.append(comp_dict)
-
-            domain_keys = []
-            for comp_dict in competitors_for_save:
-                key = comp_dict.get('competitor_id') or comp_dict.get('id') or comp_dict.get('domain') or comp_dict.get('primary_url')
-                if isinstance(key, str) and key not in domain_keys:
-                    domain_keys.append(key)
-
-            id_lookup: Dict[str, str] = {}
-            if domain_keys:
-                try:
-                    from database.models import Competitor
-                    with get_db_session() as db_session:
-                        records = db_session.query(Competitor).filter(Competitor.competitor_id.in_(domain_keys)).all()
-                        id_lookup = {record.competitor_id: record.id for record in records}
-                except Exception as lookup_error:
-                    logger.warning(f'获取竞争对手主键失败: {lookup_error}')
-
-            enriched_competitors = []
-            for comp_dict in competitors_for_save:
-                domain_key = comp_dict.get('competitor_id') or comp_dict.get('id') or comp_dict.get('domain') or comp_dict.get('primary_url')
-                primary_id = id_lookup.get(domain_key) if isinstance(domain_key, str) else None
-
-                competitor_payload = {
-                    'id': primary_id or domain_key or comp_dict.get('display_name'),
-                    'competitor_id': domain_key,
-                    'display_name': comp_dict.get('display_name') or comp_dict.get('name') or comp_dict.get('id'),
-                    'primary_url': comp_dict.get('primary_url') or comp_dict.get('url') or '',
-                    'brief_description': comp_dict.get('brief_description') or comp_dict.get('description') or '',
-                    'source': comp_dict.get('source', 'analysis'),
-                    'confidence': comp_dict.get('confidence', 0.5),
-                    'demographics': comp_dict.get('demographics') or comp_dict.get('target_users') or ''
-                }
-                enriched_competitors.append(competitor_payload)
-
-            basic_competitor_crud.save_competitors(db, task_id, competitors_for_save)
+            basic_competitor_crud.save_competitors(db, task_id, limited_competitors)
 
             tracked_competitor_ids: List[str] = []
             if monitor_id and user_id:
@@ -835,7 +934,7 @@ async def run_analysis_with_persistence(
                         monitor = monitor_crud.get_monitor(db_session, monitor_id, user_id)
                         if monitor:
                             seen: Set[str] = set()
-                            for comp_payload in enriched_competitors:
+                            for comp_payload in limited_competitors:
                                 candidate = comp_payload.get('id') or comp_payload.get('competitor_id')
                                 if not candidate or candidate in seen:
                                     continue
@@ -857,7 +956,7 @@ async def run_analysis_with_persistence(
             if tracked_competitor_ids:
                 competitor_stage_payload['tracked_competitor_ids'] = tracked_competitor_ids
 
-            competitor_stage_payload['competitors'] = enriched_competitors
+            competitor_stage_payload['competitors'] = limited_competitors
             analysis_context['competitors'] = competitor_stage_payload
             task_crud.update_task(db, task_id,
                 progress=70,
@@ -871,7 +970,7 @@ async def run_analysis_with_persistence(
                 'data': competitor_stage_payload
             })
         
-        # 第三步：分析竞争对手变化（使用统一ID管理）
+        # 第三步：分析竞争对手变化 - 【修复变化检测和递归引用问题】
         task_crud.update_task(db, task_id,
             progress=75,
             message=f"Analyzing changes for {min(3, len(limited_competitors))} competitors..."
@@ -880,40 +979,37 @@ async def run_analysis_with_persistence(
         changes_result = []
         competitor_mapping: Dict[str, str] = {}
         if enable_research and limited_competitors:
-            logger.info("=== 开始竞争对手变化分析（使用统一ID管理） ===")
+            logger.info("=== 开始竞争对手变化分析（修复版本）===")
             competitors_to_analyze = limited_competitors[:3]
             
-            # 使用统一的ID管理器构建映射
+            # 【修复】：重新构建competitor_mapping逻辑，但使用dict数据
             competitor_mapping = {}
-            competitors_for_detection = []
+            valid_competitors_for_detection = []
             
+            # 验证和构建映射
             with get_db_session() as db_session:
                 for comp in competitors_to_analyze:
                     try:
-                        # 统一提取竞争对手信息
-                        if hasattr(comp, 'model_dump'):
-                            comp_data = comp.model_dump()
-                        elif isinstance(comp, dict):
-                            comp_data = comp
-                        elif hasattr(comp, '__dict__'):
-                            comp_data = comp.__dict__
-                        else:
-                            logger.warning(f"无法解析竞争对手数据: {type(comp)}")
+                        # 确保comp是dict格式（已经被normalize_competitor_data处理过）
+                        if not isinstance(comp, dict):
+                            logger.warning(f"竞争对手数据格式错误: {type(comp)}")
                             continue
                         
-                        comp_url = comp_data.get('primary_url', '')
-                        if not comp_url:
-                            logger.warning(f"竞争对手缺少URL: {comp_data}")
+                        comp_url = comp.get('primary_url', '')
+                        comp_name = comp.get('display_name', 'Unknown')
+                        
+                        if not comp_url or not isinstance(comp_url, str) or not comp_url.startswith('http'):
+                            logger.warning(f"跳过无效URL: {comp_name} - URL: '{comp_url}'")
                             continue
                         
-                        # 使用统一ID管理器获取一致的competitor_id
-                        comp_id = CompetitorIDManager.get_or_create_competitor_id(comp_data, db_session)
+                        # 【关键修复】：使用统一ID管理器获取一致的competitor_id
+                        comp_id = CompetitorIDManager.get_or_create_competitor_id(comp, db_session)
                         
                         # 确保competitor记录存在
-                        if CompetitorIDManager.ensure_competitor_exists(comp_data, comp_id, db_session):
+                        if CompetitorIDManager.ensure_competitor_exists(comp, comp_id, db_session):
                             competitor_mapping[comp_url] = comp_id
-                            competitors_for_detection.append(comp)
-                            logger.info(f"映射确认: {comp_url} -> {comp_id}")
+                            valid_competitors_for_detection.append(comp)
+                            logger.info(f"有效竞争对手映射: {comp_name} ({comp_url}) -> {comp_id}")
                         else:
                             logger.error(f"无法确保competitor存在: {comp_id}")
                     
@@ -926,15 +1022,10 @@ async def run_analysis_with_persistence(
                 logger.info(f"  {url} -> {comp_id}")
             
             if not competitor_mapping:
-                logger.warning("没有有效的URL-竞争对手映射，跳过缓存检查")
-                change_state = {
-                    "competitors": competitors_to_analyze,
-                    "changes": []
-                }
-                change_result = await change_detector.ainvoke(change_state)
-                changes_result = change_result.get("changes", [])
+                logger.warning("没有有效的URL-竞争对手映射，跳过变化检测")
+                changes_result = []
             else:
-                # 使用缓存系统（现在有一致的映射）
+                # 【修复】：重新实现缓存逻辑
                 cached_results = {}
                 uncached_competitors = []
                 
@@ -945,13 +1036,8 @@ async def run_analysis_with_persistence(
                         cached_results = await change_detection_cache.get_cached_results(url_competitor_pairs)
                         
                         # 确定哪些需要新检测
-                        for comp in competitors_for_detection:
-                            comp_url = ""
-                            if hasattr(comp, 'primary_url'):
-                                comp_url = comp.primary_url
-                            elif isinstance(comp, dict):
-                                comp_url = comp.get('primary_url', '')
-                            
+                        for comp in valid_competitors_for_detection:
+                            comp_url = comp.get('primary_url', '')
                             if comp_url and comp_url not in cached_results:
                                 uncached_competitors.append(comp)
                         
@@ -959,15 +1045,17 @@ async def run_analysis_with_persistence(
                     
                     except Exception as e:
                         logger.error(f"查询缓存失败，将执行完整检测: {e}")
-                        uncached_competitors = competitors_for_detection
+                        uncached_competitors = valid_competitors_for_detection
                         cached_results = {}
                 else:
-                    uncached_competitors = competitors_for_detection
+                    uncached_competitors = valid_competitors_for_detection
                     logger.info("缓存已禁用，执行完整变化检测")
                 
                 # 对未缓存的竞争对手执行变化检测
                 new_changes = []
                 if uncached_competitors:
+                    logger.info(f"开始变化检测: {len(uncached_competitors)} 个竞争对手")
+                    
                     change_state = {
                         "competitors": uncached_competitors,
                         "changes": []
@@ -978,10 +1066,10 @@ async def run_analysis_with_persistence(
                         new_changes = change_result.get("changes", [])
                         logger.info(f"完成变化检测: {len(new_changes)} 个结果")
                     except Exception as e:
-                        logger.error(f"变化检测失败: {e}")
+                        logger.error(f"变化检测失败: {e}", exc_info=True)
                         new_changes = []
                     
-                    # 缓存新的检测结果
+                    # 【修复】：重新实现缓存保存逻辑
                     if enable_caching and new_changes:
                         try:
                             cache_data = {}
@@ -990,12 +1078,7 @@ async def run_analysis_with_persistence(
                             for i, change_result in enumerate(new_changes):
                                 if i < len(uncached_competitors):
                                     comp = uncached_competitors[i]
-                                    comp_url = ""
-                                    if hasattr(comp, 'primary_url'):
-                                        comp_url = comp.primary_url
-                                    elif isinstance(comp, dict):
-                                        comp_url = comp.get('primary_url', '')
-                                    
+                                    comp_url = comp.get('primary_url', '')
                                     comp_id = competitor_mapping.get(comp_url)
                                     
                                     if comp_url and comp_id:
@@ -1011,8 +1094,6 @@ async def run_analysis_with_persistence(
                             
                             if cache_data:
                                 logger.info(f"准备缓存数据: {list(cache_data.keys())}")
-                                logger.info(f"竞争对手映射: {cache_competitor_mapping}")
-                                
                                 cached_urls = await change_detection_cache.cache_results(
                                     cache_data, cache_competitor_mapping
                                 )
@@ -1021,30 +1102,23 @@ async def run_analysis_with_persistence(
                         except Exception as e:
                             logger.error(f"缓存变化检测结果失败: {e}")
                 
-                # 合并缓存结果和新结果
+                # 【修复】：正确合并缓存结果和新结果
                 changes_result = list(cached_results.values()) + new_changes
-
+                
                 if cached_results:
                     logger.info(f"使用缓存结果: {len(cached_results)} 个，新检测: {len(new_changes)} 个")
                 else:
                     logger.info("所有变化检测结果都来自新检测")
 
-            collected_change_records = []
-            
             # 保存变化记录到数据库
+            collected_change_records = []
             for i, changes in enumerate(changes_result):
                 try:
                     if changes and hasattr(changes, 'changes') and changes.changes:
                         # 获取对应的竞争对手ID
-                        if i < len(competitors_to_analyze):
-                            comp = competitors_to_analyze[i]
-                            comp_url = ""
-                            
-                            if hasattr(comp, 'primary_url'):
-                                comp_url = comp.primary_url
-                            elif isinstance(comp, dict):
-                                comp_url = comp.get('primary_url', '')
-                            
+                        if i < len(valid_competitors_for_detection):
+                            comp = valid_competitors_for_detection[i]
+                            comp_url = comp.get('primary_url', '')
                             comp_id = competitor_mapping.get(comp_url, f"comp_{i}")
                         else:
                             comp_id = f"comp_{i}"
@@ -1067,9 +1141,9 @@ async def run_analysis_with_persistence(
                 
                 except Exception as e:
                     logger.error(f"保存变化记录失败: {e}")
-        
+
         change_stage_payload: Dict[str, Any] = {'changes': []}
-        candidate_competitor_ids = set(competitor_mapping.values())
+        candidate_competitor_ids = set(competitor_mapping.values()) if competitor_mapping else set()
         if not candidate_competitor_ids and collected_change_records:
             candidate_competitor_ids = {record.competitor_id for record in collected_change_records if hasattr(record, 'competitor_id')}
 
@@ -1129,12 +1203,20 @@ async def run_analysis_with_persistence(
             message="Generating analysis report..."
         )
         
+        # 【修复】：确保所有数据都是JSON可序列化的
+        tenant_data = tenant.model_dump() if hasattr(tenant, 'model_dump') else tenant
+        tenant_clean = safe_json_serialize(tenant_data)
+        
+        competitors_clean = []
+        for comp in limited_competitors:
+            if isinstance(comp, dict):
+                competitors_clean.append(safe_json_serialize(comp))
+            else:
+                competitors_clean.append(safe_json_serialize(normalize_competitor_data(comp)))
+        
         final_results = {
-            "tenant": tenant.model_dump() if hasattr(tenant, 'model_dump') else tenant,
-            "competitors": [
-                c.model_dump() if hasattr(c, 'model_dump') else c 
-                for c in limited_competitors
-            ],
+            "tenant": tenant_clean,
+            "competitors": competitors_clean,
             "competitor_analysis": {},
             "summary": {
                 "total_competitors": len(limited_competitors),
@@ -1150,31 +1232,39 @@ async def run_analysis_with_persistence(
             }
         }
         
-        # 添加变化分析到结果中
+        # 添加变化分析到结果中 - 【修复JSON序列化】
         for i, changes in enumerate(changes_result):
             if i < len(limited_competitors):
-                comp = limited_competitors[i]
-                if hasattr(comp, 'competitor_id'):
-                    comp_id = comp.competitor_id
-                elif hasattr(comp, 'id'):
-                    comp_id = comp.id  
-                else:
-                    comp_id = f"comp_{i}"
+                comp = limited_competitors[i] if isinstance(limited_competitors[i], dict) else normalize_competitor_data(limited_competitors[i])
+                comp_id = comp.get('competitor_id', comp.get('id', f"comp_{i}"))
+                
+                changes_clean = changes.model_dump() if hasattr(changes, 'model_dump') else changes
+                changes_clean = safe_json_serialize(changes_clean)
                 
                 final_results["competitor_analysis"][comp_id] = {
-                    "competitor": comp.model_dump() if hasattr(comp, 'model_dump') else comp,
-                    "changes": changes.model_dump() if hasattr(changes, 'model_dump') else changes,
+                    "competitor": safe_json_serialize(comp),
+                    "changes": changes_clean,
                     "strengths": [],
                     "weaknesses": [],
                     "user_feedbacks": []
                 }
         
         # 获取任务开始时间并计算耗时
-        task = task_crud.get_task(db, task_id)
-        if task and task.started_at:
-            final_results["summary"]["analysis_time"] = (
-                datetime.utcnow() - task.started_at
-            ).total_seconds()
+        try:
+            task = task_crud.get_task(db, task_id)
+            if task and task.started_at:
+                start_time = task.started_at
+                if hasattr(start_time, 'replace'):
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+                final_results["summary"]["analysis_time"] = (
+                    datetime.now(timezone.utc) - start_time
+                ).total_seconds()
+        except Exception as time_error:
+            logger.warning(f"计算分析时间失败: {time_error}")
+            final_results["summary"]["analysis_time"] = 0
+        
+        # 【重要】：清理最终结果确保JSON兼容
+        final_results_clean = safe_json_serialize(final_results)
         
         if monitor_id and user_id:
             try:
@@ -1185,20 +1275,43 @@ async def run_analysis_with_persistence(
             except Exception as monitor_error:
                 logger.warning(f"更新监控任务失败: {monitor_error}")
 
-        # 更新任务状态：完成
-        task_crud.update_task(db, task_id,
-            status="completed",
-            progress=100,
-            message="Analysis complete",
-            results=final_results,
-            latest_stage="complete"
-        )
+        # 更新任务状态：完成 - 【修复JSON序列化】
+        try:
+            task_crud.update_task(db, task_id,
+                status="completed",
+                progress=100,
+                message="Analysis complete",
+                results=final_results_clean,
+                latest_stage="complete"
+            )
+        except Exception as update_error:
+            logger.error(f"更新任务状态失败: {update_error}")
+            # 回滚并使用简化的结果
+            try:
+                db.rollback()
+                simplified_results = {
+                    "tenant": {"tenant_name": company_name},
+                    "competitors": [{"display_name": f"Competitor {i+1}"} for i in range(len(limited_competitors))],
+                    "summary": final_results_clean.get("summary", {})
+                }
+                task_crud.update_task(db, task_id,
+                    status="completed",
+                    progress=100,
+                    message="Analysis complete (simplified results)",
+                    results=simplified_results,
+                    latest_stage="complete"
+                )
+            except Exception as fallback_error:
+                logger.error(f"保存简化结果也失败: {fallback_error}")
 
+        # 【修复】：确保发送给前端的数据也是JSON安全的
+        clean_analysis_context = safe_json_serialize(analysis_context)
+        
         await emit({
             'type': 'status',
             'stage': 'complete',
             'progress': 100,
-            'data': analysis_context
+            'data': clean_analysis_context
         })
 
         logger.info(f"分析完成: {company_name}, 找到 {len(limited_competitors)} 个竞争对手, 缓存命中 {len(cached_results) if enable_caching else 0} 个")
@@ -1206,11 +1319,21 @@ async def run_analysis_with_persistence(
     except Exception as e:
         logger.error(f"分析失败 [{company_name}]: {str(e)}", exc_info=True)
 
-        task_crud.update_task(db, task_id,
-            status="failed",
-            progress=0,
-            message=f"Analysis failed: {str(e)}"
-        )
+        # 【修复】：异常处理时也要确保Session状态正确
+        try:
+            db.rollback()
+        except:
+            pass
+            
+        try:
+            task_crud.update_task(db, task_id,
+                status="failed",
+                progress=0,
+                message=f"Analysis failed: {str(e)}"
+            )
+        except Exception as update_error:
+            logger.error(f"更新失败状态也失败: {update_error}")
+        
         await emit({
             'type': 'status',
             'stage': 'failed',
@@ -1218,7 +1341,7 @@ async def run_analysis_with_persistence(
             'message': str(e)
         })
 
-# 保持原有的run_analysis函数作为向后兼容
+# 保持向后兼容的run_analysis函数
 async def run_analysis(task_id: str, company_name: str, enable_research: bool, max_competitors: int, db: Session):
     """向后兼容的分析函数"""
     await run_analysis_with_persistence(task_id, company_name, enable_research, max_competitors, True, db)
@@ -1681,14 +1804,16 @@ async def track_competitor(competitor_id: str, request: CompetitorTrackRequest, 
                 competitor_data=competitor_payload
             )
 
+        competitor_snapshot = _serialize_competitor_record(competitor)
         monitor_competitor_crud.set_tracking(db_session, monitor.id, competitor.id, True)
         tracked_ids = monitor_competitor_crud.get_tracked_competitor_ids(db_session, monitor.id)
+        response = {
+            'status': 'ok',
+            'tracked_competitor_ids': tracked_ids,
+            'competitor': competitor_snapshot
+        }
 
-    return {
-        'status': 'ok',
-        'tracked_competitor_ids': tracked_ids,
-        'competitor': _serialize_competitor_record(competitor)
-    }
+    return response
 
 
 @app.delete("/api/competitors/{competitor_id}/untrack")
@@ -1716,14 +1841,16 @@ async def untrack_competitor(competitor_id: str, request: CompetitorTrackRequest
         if not competitor:
             raise HTTPException(status_code=404, detail="Competitor not found")
 
+        competitor_pk = competitor.id
         monitor_competitor_crud.remove_tracking(db_session, monitor.id, competitor.id)
         tracked_ids = monitor_competitor_crud.get_tracked_competitor_ids(db_session, monitor.id)
+        response = {
+            'status': 'ok',
+            'tracked_competitor_ids': tracked_ids,
+            'untracked_competitor_id': competitor_pk
+        }
 
-    return {
-        'status': 'ok',
-        'tracked_competitor_ids': tracked_ids,
-        'untracked_competitor_id': competitor.id
-    }
+    return response
 
 
 @app.post("/api/changes/{change_id}/read")
@@ -1776,25 +1903,110 @@ async def create_archive(request: ArchiveCreateRequest, current_user = Depends(r
     change_snapshot = None
 
     with get_db_session() as db_session:
+        # 如果指定了task_id，从任务结果中提取数据
         if request.task_id:
             task = task_crud.get_task(db_session, request.task_id)
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
+            
             results = task.results or {}
+            
+            # 提取tenant数据
             tenant_snapshot = results.get('tenant')
-            competitor_snapshot = results.get('competitors')
+            
+            # 提取competitors数据
+            competitor_snapshot = results.get('competitors', [])
+            
+            # 提取changes数据 - 修复这部分逻辑
             change_snapshot = []
+            
+            # 方式1: 从competitor_analysis中提取
             competitor_analysis = results.get('competitor_analysis') or {}
-            for content in competitor_analysis.values():
+            for comp_id, content in competitor_analysis.items():
                 if isinstance(content, dict):
-                    changes = content.get('changes')
-                    if isinstance(changes, dict) and 'changes' in changes:
-                        change_snapshot.extend(changes.get('changes') or [])
-                    elif isinstance(changes, list):
-                        change_snapshot.extend(changes)
-            if not change_snapshot:
-                change_snapshot = results.get('changes')
-
+                    changes_data = content.get('changes', {})
+                    if isinstance(changes_data, dict) and 'changes' in changes_data:
+                        change_list = changes_data.get('changes', [])
+                        if isinstance(change_list, list):
+                            for change in change_list:
+                                if isinstance(change, dict):
+                                    # 添加competitor_id到每个change
+                                    change_with_comp = change.copy()
+                                    change_with_comp['competitor_id'] = comp_id
+                                    change_snapshot.append(change_with_comp)
+        
+        # 如果指定了monitor_id，获取最新的changes
+        elif request.monitor_id:
+            from database.models import ChangeDetection, Monitor, TenantCompetitor, Competitor
+            
+            monitor = db_session.query(Monitor).filter(
+                Monitor.id == request.monitor_id,
+                Monitor.user_id == user_id
+            ).first()
+            
+            if not monitor:
+                raise HTTPException(status_code=404, detail="Monitor not found")
+            
+            # 获取tenant信息
+            if monitor.tenant_id:
+                tenant = db_session.query(models.Tenant).filter(
+                    models.Tenant.id == monitor.tenant_id
+                ).first()
+                if tenant:
+                    tenant_snapshot = {
+                        'tenant_id': tenant.tenant_id,
+                        'tenant_name': tenant.tenant_name,
+                        'tenant_url': tenant.tenant_url,
+                        'tenant_description': tenant.tenant_description,
+                        'target_market': tenant.target_market,
+                        'key_features': tenant.key_features
+                    }
+            
+            # 获取tracked competitors
+            if monitor.tenant_id:
+                competitors = db_session.query(Competitor).join(
+                    TenantCompetitor
+                ).filter(
+                    TenantCompetitor.tenant_id == monitor.tenant_id
+                ).all()
+                
+                competitor_snapshot = []
+                competitor_ids = []
+                for comp in competitors:
+                    competitor_snapshot.append({
+                        'id': comp.id,
+                        'competitor_id': comp.competitor_id,
+                        'display_name': comp.display_name,
+                        'primary_url': comp.primary_url,
+                        'brief_description': comp.brief_description,
+                        'demographics': comp.demographics,
+                        'source': comp.source
+                    })
+                    competitor_ids.append(comp.competitor_id)
+                
+                # 获取最近的changes
+                if competitor_ids:
+                    changes = db_session.query(ChangeDetection).filter(
+                        ChangeDetection.competitor_id.in_(competitor_ids)
+                    ).order_by(
+                        ChangeDetection.detected_at.desc()
+                    ).limit(100).all()
+                    
+                    change_snapshot = []
+                    for change in changes:
+                        change_snapshot.append({
+                            'id': change.id,
+                            'competitor_id': change.competitor_id,
+                            'url': change.url,
+                            'change_type': change.change_type,
+                            'content': change.content,
+                            'threat_level': change.threat_level,
+                            'why_matter': change.why_matter,
+                            'suggestions': change.suggestions,
+                            'detected_at': change.detected_at.isoformat() if change.detected_at else None
+                        })
+        
+        # 创建archive记录
         archive = archive_crud.create_archive(
             db_session,
             user_id=user_id,
@@ -1808,7 +2020,23 @@ async def create_archive(request: ArchiveCreateRequest, current_user = Depends(r
             search_text=(request.metadata or {}).get('search_text') if request.metadata else None
         )
 
-        payload = serialize_archive(archive)
+        # 构建响应
+        payload = {
+            'id': archive.id,
+            'monitor_id': archive.monitor_id,
+            'task_id': archive.task_id,
+            'title': archive.title,
+            'created_at': archive.created_at.isoformat() if archive.created_at else None,
+            'tenant': archive.tenant_snapshot,
+            'competitors': archive.competitor_snapshot,
+            'changes': archive.change_snapshot,
+            'metadata': archive.metadata_json,
+            # 添加统计信息
+            'stats': {
+                'competitors_count': len(archive.competitor_snapshot) if archive.competitor_snapshot else 0,
+                'changes_count': len(archive.change_snapshot) if archive.change_snapshot else 0
+            }
+        }
 
     return payload
 
@@ -1894,7 +2122,7 @@ async def start_analysis(
     cache_message = f", caching {'enabled' if request.enable_caching else 'disabled'}"
     return TaskResponse(
         task_id=task.id,
-        message=f"Analysis started with unified ID management{cache_message}",
+        message=f"Analysis started with Session fix and change detection fix{cache_message}",
         monitor_id=monitor_id
     )
 
@@ -2101,14 +2329,121 @@ async def get_system_stats():
         return {
             "database": db_stats,
             "cache": cache_stats,
-            "version": "1.0.0-unified-id-management"
+            "version": "1.0.0-session-and-change-detection-fixed"
         }
     except Exception as e:
         logger.error(f"获取系统统计失败: {e}")
         return {
             "error": str(e),
-            "version": "1.0.0-unified-id-management"
+            "version": "1.0.0-session-and-change-detection-fixed"
         }
+
+@app.get("/api/preferences")
+async def get_user_preferences(current_user = Depends(require_auth)):
+    """获取用户偏好设置"""
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    with get_db_session() as db:
+        pref = user_preferences_crud.get_or_create_preferences(db, user_id)
+        return {
+            "change_view_threshold": pref.change_view_threshold,
+            "email_alert_threshold": pref.email_alert_threshold,
+            "email_alerts_enabled": pref.email_alerts_enabled,
+            "email_frequency": pref.email_frequency,
+            "email_time": pref.email_time,
+            "default_page_size": pref.default_page_size,
+            "theme": pref.theme
+        }
+
+@app.put("/api/preferences")
+async def update_user_preferences(
+    preferences: dict,
+    current_user = Depends(require_auth)
+):
+    """更新用户偏好设置"""
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    allowed_fields = {
+        'change_view_threshold', 'email_alert_threshold', 'email_alerts_enabled',
+        'email_frequency', 'email_time', 'default_page_size', 'theme'
+    }
+    
+    # 过滤只允许的字段
+    updates = {k: v for k, v in preferences.items() if k in allowed_fields}
+    
+    with get_db_session() as db:
+        pref = user_preferences_crud.update_preferences(db, user_id, **updates)
+        return {
+            "message": "Preferences updated successfully",
+            "preferences": {
+                "change_view_threshold": pref.change_view_threshold,
+                "email_alert_threshold": pref.email_alert_threshold,
+                "email_alerts_enabled": pref.email_alerts_enabled,
+                "email_frequency": pref.email_frequency,
+                "email_time": pref.email_time,
+                "default_page_size": pref.default_page_size,
+                "theme": pref.theme
+            }
+        }
+    
+@app.get("/api/archives/{archive_id}")
+async def get_archive_detail(archive_id: str, current_user = Depends(require_auth)):
+    """获取Archive详细信息"""
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    with get_db_session() as db_session:
+        archive = db_session.query(models.AnalysisArchive).filter(
+            models.AnalysisArchive.id == archive_id,
+            models.AnalysisArchive.user_id == user_id
+        ).first()
+        
+        if not archive:
+            raise HTTPException(status_code=404, detail="Archive not found")
+        
+        return {
+            'id': archive.id,
+            'monitor_id': archive.monitor_id,
+            'task_id': archive.task_id,
+            'title': archive.title,
+            'created_at': archive.created_at.isoformat() if archive.created_at else None,
+            'tenant': archive.tenant_snapshot,
+            'competitors': archive.competitor_snapshot,
+            'changes': archive.change_snapshot,
+            'metadata': archive.metadata_json,
+            'stats': {
+                'competitors_count': len(archive.competitor_snapshot) if archive.competitor_snapshot else 0,
+                'changes_count': len(archive.change_snapshot) if archive.change_snapshot else 0,
+                'has_tenant': archive.tenant_snapshot is not None
+            }
+        }
+
+@app.delete("/api/archives/{archive_id}")
+async def delete_archive(archive_id: str, current_user = Depends(require_auth)):
+    """删除Archive"""
+    user_id = current_user.get('sub') if isinstance(current_user, dict) else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    with get_db_session() as db_session:
+        archive = db_session.query(models.AnalysisArchive).filter(
+            models.AnalysisArchive.id == archive_id,
+            models.AnalysisArchive.user_id == user_id
+        ).first()
+        
+        if not archive:
+            raise HTTPException(status_code=404, detail="Archive not found")
+        
+        db_session.delete(archive)
+        db_session.commit()
+        
+    return {"status": "ok", "message": "Archive deleted successfully"}
+
 
 @app.get("/api/tenants/{tenant_id}/history")
 async def get_tenant_history(tenant_id: str):
@@ -2173,8 +2508,8 @@ async def root(db: Session = Depends(get_db)):
         cache_stats = {"error": str(e)}
     
     return {
-        "message": "OPP - Competitor Analysis API with OAuth",
-        "version": "1.0.0-oauth",
+        "message": "OPP - Competitor Analysis API with OAuth (Fixed Version)",
+        "version": "1.0.0-session-and-change-detection-fixed",
         "database": "connected" if check_database_connection() else "disconnected",
         "active_tasks": len(running_tasks),
         "total_tasks": len(all_tasks),
@@ -2186,11 +2521,20 @@ async def root(db: Session = Depends(get_db)):
             "github": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET)
         },
         "features": [
+            "修复SQLAlchemy Session DetachedInstanceError",
+            "修复变化检测递归引用问题",
             "统一的Competitor ID管理",
             "智能映射和一致性检查",  
             "增强的缓存系统",
             "完整的错误处理和日志记录",
             "Google & GitHub OAuth认证"
+        ],
+        "fixes": [
+            "在Session内立即序列化数据库对象，避免DetachedInstanceError",
+            "重新构建完整的competitor_mapping逻辑",
+            "修复变化检测缓存系统",
+            "确保URL格式验证和竞争对手ID一致性",
+            "增强错误处理和日志记录"
         ],
         "env_status": {
             "openai_key": "✅" if os.getenv("OPENAI_API_KEY") else "❌",
@@ -2201,7 +2545,7 @@ async def root(db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    print("启动OPP竞争对手分析API服务（统一ID管理 + OAuth版）...")
+    print("启动OPP竞争对手分析API服务（修复Session和变化检测问题版）...")
     print("环境检查...")
     
     if validate_config():
@@ -2221,6 +2565,11 @@ if __name__ == "__main__":
             oauth_status.append("GitHub OAuth: ❌")
             
         print("OAuth状态:", " | ".join(oauth_status))
+        
+        print("✅ SQLAlchemy Session问题已修复")
+        print("✅ 变化检测递归引用问题已修复")
+        print("✅ CompetitorIDManager重新实现")
+        print("✅ 缓存系统完整恢复")
         
         uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
     else:

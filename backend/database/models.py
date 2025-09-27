@@ -120,7 +120,7 @@ class Monitor(Base):
     __tablename__ = "monitors"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False, index=True)  # 添加这行
     tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True, index=True)
     name = Column(String, nullable=False)
     url = Column(String, nullable=False)
@@ -131,7 +131,7 @@ class Monitor(Base):
     is_active = Column(Boolean, default=True)
     latest_task_id = Column(String, ForeignKey('analysis_tasks.id', name='fk_monitors_latest_task_id'), nullable=True, index=True)
 
-    user = relationship("User", back_populates="monitors")
+    user = relationship("User", back_populates="monitors")  # 添加这行
     tenant = relationship("Tenant")
     tasks = relationship("AnalysisTask", back_populates="monitor", foreign_keys="AnalysisTask.monitor_id")
     latest_task = relationship("AnalysisTask", foreign_keys=[latest_task_id], post_update=True)
@@ -143,7 +143,6 @@ class Monitor(Base):
         Index('idx_monitor_user', 'user_id'),
         Index('idx_monitor_tenant', 'tenant_id'),
     )
-
 
 class MonitorCompetitor(Base):
     """用户监控的竞争对手映射表"""
@@ -199,7 +198,7 @@ class ChangeDetectionCache(Base):
         return datetime.utcnow() > cache_record.expires_at
 
 class ChangeDetection(Base):
-    """变化检测记录 - 原有实现保留"""
+    """变化检测记录 - 增强版本"""
     __tablename__ = "change_detections"
 
     id = Column(String, primary_key=True, default=generate_uuid)
@@ -212,8 +211,47 @@ class ChangeDetection(Base):
     suggestions = Column(Text)
     detected_at = Column(DateTime, default=datetime.utcnow)
     
+    # 新增字段
+    is_first = Column(Boolean, default=True, index=True)  # 区分首次/持续检测
+    monitor_id = Column(String, ForeignKey('monitors.id'), nullable=True, index=True)  # 关联monitor
+    
+    # 关系
     read_receipts = relationship("ChangeReadReceipt", back_populates="change", cascade="all, delete-orphan")
+    monitor = relationship("Monitor", backref="change_detections")
+    
+    # 添加索引优化查询
+    __table_args__ = (
+        Index('idx_change_detection_query', 'monitor_id', 'detected_at', 'is_first'),
+        Index('idx_change_detection_threat', 'threat_level', 'detected_at'),
+    )
 
+class UserPreferences(Base):
+    """用户偏好设置"""
+    __tablename__ = "user_preferences"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey('users.id'), unique=True, nullable=False)
+    
+    # Change Radar阈值设置
+    change_view_threshold = Column(Float, default=0.0)  # 前端显示阈值
+    email_alert_threshold = Column(Float, default=7.0)  # 邮件通知阈值
+    email_alerts_enabled = Column(Boolean, default=False)  # 是否启用邮件通知
+    
+    # 邮件设置
+    email_frequency = Column(String, default="daily")  # daily, weekly, immediate
+    email_time = Column(String, default="09:00")  # 发送时间 HH:MM
+    last_email_sent = Column(DateTime, nullable=True)
+    
+    # 其他偏好
+    default_page_size = Column(Integer, default=10)
+    theme = Column(String, default="system")
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # 关系
+    user = relationship("User", backref="preferences", uselist=False)
+    
 class ContentStorage(Base):
     """内容存储表 - 支持OngoingTracker的previous content存储"""
     __tablename__ = "content_storage"
